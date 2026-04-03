@@ -81,7 +81,10 @@ def get_budget() -> tuple[int, int]:
     print("\nEnter your budget range:")
     while True:
         try:
-            lo = parse_dollars(input("   Minimum ($): "))
+            lo = parse_dollars(input("   Minimum ($ or 0 for none): "))
+            if lo < 0:
+                print("   Enter 0 or a positive number.")
+                continue
             break
         except ValueError:
             print("   Please enter a valid number.")
@@ -99,11 +102,13 @@ def get_budget() -> tuple[int, int]:
 # ── Prompt construction ───────────────────────────────────────────────────────
 
 def build_prompt(location: str, category: str, subtype: str,
-                 lo: int, hi: int) -> str:
+                 lo: int, hi: int, num_listings: int = 5) -> str:
     sources = ", ".join(SOURCE_MAP.get(category, ["Zillow", "Realtor.com"]))
     today   = datetime.now().strftime("%B %d, %Y")
 
-    unit_label = "per acre" if category == "land" else "per sq ft"
+    unit_label  = "per acre" if category == "land" else "per sq ft"
+    budget_low  = f"${lo:,}" if lo > 0 else "no minimum"
+    budget_disp = f"{budget_low} – ${hi:,}"
 
     return f"""You are PropScout, an expert real estate market research agent. \
 A buyer has hired you to research current listings and market conditions.
@@ -112,17 +117,19 @@ BUYER CRITERIA
 --------------
 Location:      {location}
 Property Type: {subtype.title()} ({category.title()})
-Budget Range:  ${lo:,} – ${hi:,}
+Budget Range:  {budget_disp}
 Primary Data Sources: {sources}
 
 RESEARCH INSTRUCTIONS
 ---------------------
-1. Search {sources} for ACTIVE {subtype} listings in {location} priced \
-between ${lo:,} and ${hi:,}. Use multiple searches to gather comprehensive data.
+1. Search {sources} for ACTIVE {subtype} listings in {location}\
+{f" priced up to ${hi:,}" if lo == 0 else f" priced between ${lo:,} and ${hi:,}"}. \
+Use multiple searches to gather comprehensive data.
 2. Look for recent sold data and market statistics for this property type in \
 this specific area.
-3. Identify 3–5 specific real current listings (real addresses, real prices, \
-real details from your search results).
+3. Identify {num_listings} specific real current listings (real addresses, real prices, \
+real details from your search results). Search aggressively — try multiple queries \
+until you have {num_listings} distinct properties.
 4. Collect: average asking price, price {unit_label}, average days on market, \
 total active inventory near the budget range, and any price-trend data.
 
@@ -138,7 +145,7 @@ actual listing details you found.
 
   Location:       {location}
   Property Type:  {subtype.title()} ({category.title()})
-  Budget Range:   ${lo:,} – ${hi:,}
+  Budget Range:   {budget_disp}
   Report Date:    {today}
 
 {'─' * 62}
@@ -156,8 +163,8 @@ actual listing details you found.
   PRICE DISTRIBUTION
 {'─' * 62}
 
-  Below budget  (< ${lo:,}):           [X]% of active listings
-  Within budget (${lo:,} – ${hi:,}):   [X]% of active listings   ← YOUR TARGET
+  {"Below budget  (< " + budget_disp.split("–")[0].strip() + "):           [X]% of active listings" if lo > 0 else ""}
+  Within budget ({budget_disp}):   [X]% of active listings   ← YOUR TARGET
   Above budget  (> ${hi:,}):           [X]% of active listings
 
   [2–3 sentences: what does this distribution mean for negotiating power?]
@@ -179,7 +186,7 @@ actual listing details you found.
   #2
   [same format]
 
-  [Continue for 3–5 listings total]
+  [Continue for {num_listings} listings total]
 
 {'─' * 62}
   MARKET NARRATIVE
@@ -191,7 +198,7 @@ actual listing details you found.
   notable shifts in the past 30–60 days?]
 
   PARAGRAPH 2 — WHAT YOUR BUDGET BUYS:
-  [Explain specifically what ${lo:,}–${hi:,} gets a buyer in {location}
+  [Explain specifically what {budget_disp} gets a buyer in {location}
   today. Are there specific neighborhoods or zip codes where the budget
   stretches further? Any emerging areas worth considering?]
 
@@ -213,9 +220,9 @@ actual listing details you found.
 # ── Research engine ───────────────────────────────────────────────────────────
 
 def run_research(location: str, category: str, subtype: str,
-                 lo: int, hi: int) -> str:
+                 lo: int, hi: int, num_listings: int = 5) -> str:
     client  = anthropic.Anthropic()
-    prompt  = build_prompt(location, category, subtype, lo, hi)
+    prompt  = build_prompt(location, category, subtype, lo, hi, num_listings)
     messages = [{"role": "user", "content": prompt}]
 
     print()
@@ -343,7 +350,8 @@ def main():
     section("SEARCH PARAMETERS")
     print(f"  Location:      {location}")
     print(f"  Property Type: {subtype.title()} ({category.title()})")
-    print(f"  Budget:        ${lo:,} – ${hi:,}")
+    budget_label = f"No minimum – ${hi:,}" if lo == 0 else f"${lo:,} – ${hi:,}"
+    print(f"  Budget:        {budget_label}")
     hr()
 
     go = input("\n  Start research? (y/n): ").strip().lower()
@@ -353,7 +361,7 @@ def main():
 
     # ── Research ─────────────────────────────────────────────────────────────
     try:
-        report = run_research(location, category, subtype, lo, hi)
+        report = run_research(location, category, subtype, lo, hi, num_listings=10)
     except anthropic.APIConnectionError:
         print("\n\nERROR: Could not connect to the API. Check your internet connection.")
         sys.exit(1)
