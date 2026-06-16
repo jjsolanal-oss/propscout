@@ -239,10 +239,9 @@ def run_research(location: str, category: str, subtype: str,
     max_continuations = 5
     for _ in range(max_continuations):
         with client.messages.stream(
-            model="claude-sonnet-4-0",
+            model="claude-sonnet-4-6",
             max_tokens=8000,
-            tools=[{"type": "web_search_20260209", "name": "web_search",
-                    "allowed_callers": ["direct"]}],
+            tools=[{"type": "web_search_20260209", "name": "web_search"}],
             messages=messages,
         ) as stream:
             for event in stream:

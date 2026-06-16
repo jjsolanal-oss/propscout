@@ -23,7 +23,7 @@ from openpyxl.utils import get_column_letter
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MODEL = "claude-sonnet-4-0"
+MODEL = "claude-sonnet-4-6"
 
 PLATFORMS = ["Crexi", "LoopNet", "Brevitas"]
 
@@ -210,7 +210,6 @@ def search_platform(client: anthropic.Anthropic,
                 tools=[{
                     "type": "web_search_20260209",
                     "name": "web_search",
-                    "allowed_callers": ["direct"],
                 }],
                 messages=messages,
             ) as stream:
