@@ -1,66 +1,83 @@
 #!/usr/bin/env python3
 """
-PropScout V2 Phase 1
-Commercial RE scraper — San Antonio metro
-Platforms: Crexi, LoopNet, Brevitas
-Types:     flex industrial, small bay industrial, land
+PropScout V2 Phase 1 — Direct scraper + Claude batch classifier
+
+Architecture:
+  1. requests + BeautifulSoup  → scrape Crexi & LoopNet directly
+  2. ONE Claude API call        → batch-classify + flag all listings
+  3. openpyxl                  → export propscout_sa_phase1.xlsx
+  4. JSON                      → save raw listings to propscout_sa_raw.json
 """
 
 import anthropic
 import json
 import os
 import re
-import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional
 
+import requests
+from bs4 import BeautifulSoup
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MODEL = "claude-sonnet-4-6"
+MODEL        = "claude-sonnet-4-6"
+RAW_JSON     = "propscout_sa_raw.json"
+EXCEL_PATH   = "propscout_sa_phase1.xlsx"
+PAGE_DELAY   = 2.0   # seconds between page requests
+MAX_PAGES    = 5     # pages to try per target URL
+REQ_TIMEOUT  = 20    # seconds per HTTP request
 
-PLATFORMS = ["Crexi", "LoopNet", "Brevitas"]
-
-PROPERTY_TYPES = ["flex industrial", "small bay industrial", "land"]
-
-METRO_CITIES = [
-    "San Antonio", "Schertz", "New Braunfels", "Converse",
-    "Universal City", "Live Oak", "Helotes", "Boerne", "Seguin", "San Marcos",
+SCRAPE_TARGETS = [
+    {
+        "platform":  "Crexi",
+        "prop_type": "flex industrial",
+        "url": "https://www.crexi.com/properties?types=Industrial&state=TX&city=San+Antonio",
+    },
+    {
+        "platform":  "Crexi",
+        "prop_type": "land",
+        "url": "https://www.crexi.com/properties?types=Land&state=TX&city=San+Antonio",
+    },
+    {
+        "platform":  "LoopNet",
+        "prop_type": "mixed",   # inferred per-listing from name/details
+        "url": "https://www.loopnet.com/search/commercial-real-estate/san-antonio-tx/for-sale/",
+    },
 ]
 
-CURRENT_YEAR      = datetime.now().year
-VALUE_ADD_MIN_AGE = 10
-SITE_UNCOV_MAX    = 0.50
-SQF_PER_ACRE      = 43_560
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest":  "document",
+    "Sec-Fetch-Mode":  "navigate",
+    "Sec-Fetch-Site":  "none",
+    "Cache-Control":   "max-age=0",
+}
 
+SQF_PER_ACRE      = 43_560
 VA_PSF_THRESHOLD  = 120.0
 DEV_PSF_THRESHOLD = 5.0
-BELOW_AVG_PCT     = 0.10
 
-ADDR_SIM_MIN      = 0.80
-PRICE_TOL         = 0.05
-
-MAX_SEARCHES      = 10    # hard cap: web searches per API call
-CALL_TIMEOUT      = 180   # 3-minute hard abort per call via SIGALRM
-INTER_CALL_PAUSE  = 5     # seconds to pause between calls
-
-EXCEL_PATH        = "propscout_sa_phase1.xlsx"
-
-
-# ── Timeout support ───────────────────────────────────────────────────────────
-
-class _CallTimeout(Exception):
-    pass
-
-def _timeout_handler(signum, frame):
-    raise _CallTimeout()
+CURRENT_YEAR = datetime.now().year
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -69,7 +86,7 @@ def _timeout_handler(signum, frame):
 class Listing:
     listing_name:     str            = ""
     address:          str            = ""
-    city:             str            = ""
+    city:             str            = "San Antonio"
     state:            str            = "TX"
     zip_code:         str            = ""
     price:            Optional[float] = None
@@ -82,269 +99,505 @@ class Listing:
     property_type:    str            = ""
     listing_source:   str            = ""
     listing_url:      str            = ""
-    also_listed_on:   str            = ""
     deal_type:        str            = ""
     deal_type_reason: str            = ""
     flag:             str            = ""
 
 
-# ── Search prompt ─────────────────────────────────────────────────────────────
+# ── Number parsing helpers ────────────────────────────────────────────────────
 
-def build_search_prompt(platform: str, prop_type: str) -> str:
-    cities = ", ".join(METRO_CITIES)
-    platform_domain = f"{platform.lower()}.com"
-    return f"""You are a commercial real estate data extraction agent.
-
-YOUR TASK: Search {platform} for {prop_type} listings FOR SALE in the San Antonio TX metro area.
-
-TARGET PLATFORM: {platform} ({platform_domain})
-PROPERTY TYPE:   {prop_type}
-GEOGRAPHY:       {cities} — all in Texas
-
-!!!  HARD LIMIT: You may perform AT MOST {MAX_SEARCHES} web searches total.  !!!
-!!!  After your {MAX_SEARCHES}th search, STOP immediately and output JSON.   !!!
-DO NOT perform search #{MAX_SEARCHES + 1} or beyond under any circumstances.
-
-SEARCH PLAN (stop as soon as you have 5+ listings OR reach {MAX_SEARCHES} searches):
-1. Search {platform_domain} for "{prop_type} for sale San Antonio TX"
-2. Google: site:{platform_domain} "{prop_type}" "San Antonio"
-3. Google: {platform} "{prop_type}" "San Antonio TX" price
-4. Try one suburban city if needed: Schertz, New Braunfels, or Boerne TX
-5. One fallback with related term: "industrial" OR "flex space" OR "warehouse"
-STOP after {MAX_SEARCHES} searches — do not search further.
-
-EXTRACT FOR EACH LISTING:
-- listing_name:    title or property name from the listing page
-- address:         street address only (no city or state)
-- city:            city name
-- state:           TX
-- zip_code:        5-digit ZIP
-- price:           asking price as plain number (no $, no commas), null if not shown
-- total_sqft:      building square footage as plain number, null if unavailable
-- year_built:      4-digit integer, null if unavailable
-- lot_size_acres:  lot size in decimal acres, null if unavailable
-- zoning:          zoning code or designation, null if unavailable
-- days_on_market:  integer number of days, null if unavailable
-- listing_url:     direct URL to the specific listing on {platform_domain}
-
-CRITICAL: Only include listings in these Texas cities: {cities}.
-Skip any listing outside this geography.
-
-After completing your searches (or reaching the {MAX_SEARCHES}-search limit), return ONLY a
-JSON object (no other text, no markdown):
-{{
-  "listings": [
-    {{
-      "listing_name": "string",
-      "address": "string",
-      "city": "string",
-      "state": "TX",
-      "zip_code": "string or null",
-      "price": 1234567,
-      "total_sqft": 12000,
-      "year_built": 1998,
-      "lot_size_acres": 1.5,
-      "zoning": "I-1",
-      "days_on_market": 45,
-      "listing_url": "https://..."
-    }}
-  ],
-  "search_notes": "brief summary of what you found and any limitations"
-}}"""
+def _parse_price(text: str) -> Optional[float]:
+    if not text:
+        return None
+    text = str(text).strip()
+    m = re.search(r"([\d,]+\.?\d*)\s*([KkMmBb])?", text.replace("$", "").replace(",", ""))
+    if not m:
+        return None
+    val = float(m.group(1))
+    suffix = (m.group(2) or "").upper()
+    if suffix == "K":
+        val *= 1_000
+    elif suffix == "M":
+        val *= 1_000_000
+    elif suffix == "B":
+        val *= 1_000_000_000
+    return val if val > 0 else None
 
 
-# ── JSON extraction ───────────────────────────────────────────────────────────
-
-def extract_json(text: str) -> Optional[dict]:
-    m = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+def _parse_sqft(text: str) -> Optional[float]:
+    if not text:
+        return None
+    text = re.sub(r"[,\s]*(sq\.?\s*ft\.?|sqft|sf)\b", "", str(text), flags=re.IGNORECASE)
+    text = text.replace(",", "")
+    m = re.search(r"[\d]+\.?\d*", text)
     if m:
         try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
+            return float(m.group())
+        except ValueError:
             pass
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i, ch in enumerate(text[start:], start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
-                    break
     return None
 
 
-# ── Type coercions ────────────────────────────────────────────────────────────
-
-def _float(val) -> Optional[float]:
-    if val is None:
+def _parse_int(text) -> Optional[int]:
+    if text is None:
         return None
-    try:
-        v = float(str(val).replace(",", "").replace("$", "").strip())
-        return v if v > 0 else None
-    except (ValueError, TypeError):
+    m = re.search(r"\d+", str(text).replace(",", ""))
+    return int(m.group()) if m else None
+
+
+def _parse_acres(text) -> Optional[float]:
+    if text is None:
         return None
+    m = re.search(r"[\d]+\.?\d*", str(text).replace(",", ""))
+    if m:
+        val = float(m.group())
+        return val if val > 0 else None
+    return None
 
 
-def _int(val) -> Optional[int]:
-    if val is None:
+# ── Crexi scraping ────────────────────────────────────────────────────────────
+
+def _deep_find_list(obj, depth=0) -> Optional[list]:
+    """Recursively find first list of dicts that looks like property listings."""
+    if depth > 8:
         return None
-    try:
-        return int(float(str(val).strip()))
-    except (ValueError, TypeError):
-        return None
+    if isinstance(obj, list) and len(obj) >= 1 and isinstance(obj[0], dict):
+        keys = set(obj[0].keys())
+        if keys & {"address", "price", "askingPrice", "listPrice", "streetAddress",
+                   "sqft", "buildingSize", "slug", "propertyId"}:
+            return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            r = _deep_find_list(v, depth + 1)
+            if r:
+                return r
+    return None
 
 
-# ── Platform search ───────────────────────────────────────────────────────────
+def _listings_from_crexi_json(data: dict, prop_type: str) -> list[Listing]:
+    """Extract Listing objects from Crexi's Next.js __NEXT_DATA__ blob."""
+    page_props = data.get("props", {}).get("pageProps", {})
 
-def search_platform(client: anthropic.Anthropic,
-                    platform: str, prop_type: str) -> list[Listing]:
-    prompt   = build_search_prompt(platform, prop_type)
-    messages = [{"role": "user", "content": prompt}]
-
-    full_text    = ""
-    search_count = 0
-    tool_buf     = ""
-    in_tool      = False
-    hit_cap      = False
-
-    metro_lower = {c.lower() for c in METRO_CITIES}
-
-    for _continuation in range(6):
-        # After hitting the cap we run one tool-free pass to collect JSON
-        tools = [] if hit_cap else [{"type": "web_search_20260209", "name": "web_search"}]
-
-        try:
-            with client.messages.stream(
-                model=MODEL,
-                max_tokens=4000,
-                tools=tools,
-                messages=messages,
-            ) as stream:
-                for event in stream:
-                    etype = getattr(event, "type", None)
-
-                    if etype == "content_block_start":
-                        cb = event.content_block
-                        if cb.type == "server_tool_use":
-                            in_tool  = True
-                            tool_buf = ""
-                        else:
-                            in_tool = False
-
-                    elif etype == "content_block_delta":
-                        delta = event.delta
-                        dtype = getattr(delta, "type", None)
-                        if dtype == "input_json_delta" and in_tool:
-                            tool_buf += getattr(delta, "partial_json", "")
-                        elif dtype == "text_delta":
-                            full_text += delta.text
-
-                    elif etype == "content_block_stop" and in_tool:
-                        search_count += 1
-                        try:
-                            q = json.loads(tool_buf).get("query", "")
-                        except Exception:
-                            q = "…"
-                        ts = datetime.now().strftime("%H:%M:%S")
-                        print(f"      [{search_count:>2}/{MAX_SEARCHES}] {ts}  {q[:60]}")
-                        sys.stdout.flush()
-                        in_tool  = False
-                        tool_buf = ""
-
-                        if search_count >= MAX_SEARCHES:
-                            hit_cap = True
-                            break  # exit event loop early; get_final_message below
-
-                try:
-                    final = stream.get_final_message()
-                except Exception:
-                    final = None
-
-        except anthropic.RateLimitError:
-            print("      ⚠ Rate limit — waiting 60s …")
-            sys.stdout.flush()
-            time.sleep(60)
-            continue
-
-        if hit_cap and not full_text:
-            # Stream was cut mid-search — inject context and request JSON
-            partial_content = final.content if (final and final.content) else []
-            if partial_content:
-                messages.append({"role": "assistant", "content": partial_content})
-            else:
-                messages.append({"role": "assistant",
-                                 "content": f"I performed {search_count} searches."})
-            messages.append({"role": "user",
-                             "content": (
-                                 f"You have reached the {MAX_SEARCHES}-search limit. "
-                                 "Stop all searching now. Return ONLY the JSON object with "
-                                 "every listing you found. If none were found, return "
-                                 '{"listings": [], "search_notes": "none found"}.'
-                             )})
-            continue  # next iteration: tools=[], forces plain JSON response
-
-        if final is None:
+    raw_list = None
+    for path in [
+        lambda d: d.get("properties"),
+        lambda d: d.get("listings"),
+        lambda d: d.get("data", {}).get("properties"),
+        lambda d: d.get("initialState", {}).get("properties", {}).get("list"),
+        lambda d: d.get("searchResults", {}).get("properties"),
+        lambda d: _deep_find_list(d),
+    ]:
+        raw_list = path(page_props)
+        if isinstance(raw_list, list) and raw_list:
             break
 
-        if final.stop_reason != "pause_turn":
-            break
+    if not raw_list:
+        raw_list = _deep_find_list(data)
 
-        messages.append({"role": "assistant", "content": final.content})
-
-        if hit_cap:
-            # Already injected the JSON request above on first cap hit
-            messages.append({"role": "user",
-                             "content": "Return the JSON now. No more searches."})
-
-    data = extract_json(full_text)
-    if not data or "listings" not in data:
-        print("      ⚠ No parseable JSON returned")
+    if not raw_list:
         return []
 
-    notes = data.get("search_notes", "")
-    if notes:
-        print(f"      Notes: {notes[:120]}")
-
-    listings: list[Listing] = []
-    for raw in data.get("listings", []):
-        if not isinstance(raw, dict):
+    out = []
+    for item in raw_list:
+        if not isinstance(item, dict):
             continue
 
-        city = str(raw.get("city") or "").strip()
-        if city and city.lower() not in metro_lower:
-            if "san antonio" not in city.lower():
-                continue
-        if not raw.get("address") and not raw.get("listing_name"):
+        addr = str(item.get("address") or item.get("streetAddress") or
+                   item.get("street") or "").strip()
+        city = str(item.get("city") or item.get("cityName") or "San Antonio").strip()
+        state = str(item.get("state") or item.get("stateCode") or "TX").strip()
+        zip_code = str(item.get("zip") or item.get("zipCode") or "").strip()
+
+        price_raw = (item.get("price") or item.get("askingPrice") or
+                     item.get("listPrice") or item.get("salePrice"))
+        price = _parse_price(str(price_raw)) if price_raw is not None else None
+
+        sqft_raw = (item.get("sqft") or item.get("buildingSize") or
+                    item.get("totalSize") or item.get("size"))
+        sqft = _parse_sqft(str(sqft_raw)) if sqft_raw is not None else None
+
+        year = _parse_int(item.get("yearBuilt") or item.get("year_built"))
+        acres = _parse_acres(item.get("lotSize") or item.get("acreage") or
+                             item.get("lot_size"))
+        dom = _parse_int(item.get("daysOnMarket") or item.get("days_on_market"))
+
+        slug = item.get("slug") or item.get("id") or item.get("propertyId") or ""
+        url = str(item.get("url") or item.get("listingUrl") or
+                  (f"https://www.crexi.com/properties/{slug}" if slug else "")).strip()
+
+        name = str(item.get("name") or item.get("title") or item.get("propertyName") or
+                   item.get("listingTitle") or addr or "Crexi Listing").strip()
+
+        psf = round(price / sqft, 2) if (price and sqft and sqft > 0) else None
+
+        if not addr and not name:
             continue
 
-        lst = Listing(
-            listing_name   = str(raw.get("listing_name") or "").strip(),
-            address        = str(raw.get("address")      or "").strip(),
+        out.append(Listing(
+            listing_name   = name[:120],
+            address        = addr[:120],
             city           = city,
-            state          = "TX",
-            zip_code       = str(raw.get("zip_code")     or "").strip(),
-            price          = _float(raw.get("price")),
-            total_sqft     = _float(raw.get("total_sqft")),
-            year_built     = _int(raw.get("year_built")),
-            lot_size_acres = _float(raw.get("lot_size_acres")),
-            zoning         = raw.get("zoning") or None,
-            days_on_market = _int(raw.get("days_on_market")),
+            state          = state,
+            zip_code       = zip_code[:10],
+            price          = price,
+            total_sqft     = sqft,
+            price_per_sqft = psf,
+            year_built     = year,
+            lot_size_acres = acres,
+            days_on_market = dom,
             property_type  = prop_type,
-            listing_source = platform,
-            listing_url    = str(raw.get("listing_url") or "").strip(),
-        )
-        listings.append(lst)
+            listing_source = "Crexi",
+            listing_url    = url[:300],
+        ))
+
+    return out
+
+
+def _listings_from_crexi_html(soup: BeautifulSoup, prop_type: str) -> list[Listing]:
+    """Fallback: parse Crexi listing cards from rendered HTML."""
+    selectors = [
+        ".property-card", "[data-testid='property-card']", ".listing-card",
+        "article.property", ".search-result-item", ".property-row",
+    ]
+    cards = []
+    for sel in selectors:
+        cards = soup.select(sel)
+        if cards:
+            break
+
+    out = []
+    for card in cards:
+        try:
+            name_el = (card.select_one(".property-name, .listing-name, h2, h3"))
+            name = name_el.get_text(strip=True) if name_el else ""
+
+            addr_el = card.select_one(".property-address, .address, [data-testid='address']")
+            addr_raw = addr_el.get_text(strip=True) if addr_el else ""
+
+            price_el = card.select_one(".property-price, .price, [data-testid='price']")
+            price_text = price_el.get_text(strip=True) if price_el else ""
+
+            size_el = card.select_one(".property-size, .sqft, .size")
+            size_text = size_el.get_text(strip=True) if size_el else ""
+
+            link = card.select_one("a[href]")
+            href = link["href"] if link else ""
+            if href and not href.startswith("http"):
+                href = f"https://www.crexi.com{href}"
+
+            price = _parse_price(price_text)
+            sqft  = _parse_sqft(size_text)
+            psf   = round(price / sqft, 2) if (price and sqft and sqft > 0) else None
+
+            # Parse city / zip from address text
+            city = "San Antonio"
+            zip_code = ""
+            clean_addr = addr_raw
+            parts = addr_raw.split(",")
+            if len(parts) >= 2:
+                clean_addr = parts[0].strip()
+                rest = ",".join(parts[1:])
+                cm = re.match(r"\s*(.+?)\s+(TX|Texas)", rest, re.IGNORECASE)
+                if cm:
+                    city = cm.group(1).strip()
+            zm = re.search(r"\b(\d{5})\b", addr_raw)
+            if zm:
+                zip_code = zm.group(1)
+
+            if not name and not clean_addr:
+                continue
+
+            out.append(Listing(
+                listing_name   = name,
+                address        = clean_addr,
+                city           = city,
+                state          = "TX",
+                zip_code       = zip_code,
+                price          = price,
+                total_sqft     = sqft,
+                price_per_sqft = psf,
+                property_type  = prop_type,
+                listing_source = "Crexi",
+                listing_url    = href,
+            ))
+        except Exception:
+            continue
+
+    return out
+
+
+def scrape_crexi(session: requests.Session, target: dict) -> list[Listing]:
+    url       = target["url"]
+    prop_type = target["prop_type"]
+    listings  = []
+
+    for page in range(1, MAX_PAGES + 1):
+        page_url = url if page == 1 else f"{url}&page={page}"
+        print(f"    page {page}: {page_url[:90]}")
+        sys.stdout.flush()
+
+        try:
+            resp = session.get(page_url, timeout=REQ_TIMEOUT)
+        except Exception as e:
+            print(f"    ✗ request error: {e}")
+            break
+
+        print(f"    HTTP {resp.status_code}  ({len(resp.text):,} bytes)")
+
+        if resp.status_code in (403, 429, 503):
+            print(f"    ✗ blocked (HTTP {resp.status_code})")
+            break
+        if resp.status_code != 200:
+            print(f"    ✗ unexpected status {resp.status_code}")
+            break
+
+        # Cloudflare challenge detection
+        if ("cf-ray" in resp.headers or
+                "checking your browser" in resp.text.lower() or
+                "enable javascript" in resp.text.lower()):
+            print("    ✗ Cloudflare/JS challenge — scraping blocked")
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Strategy 1: Next.js __NEXT_DATA__
+        next_tag = soup.find("script", id="__NEXT_DATA__")
+        if next_tag and next_tag.string:
+            try:
+                next_data = json.loads(next_tag.string)
+                found = _listings_from_crexi_json(next_data, prop_type)
+                if found:
+                    print(f"    ✓ Next.js JSON → {len(found)} listings")
+                    listings.extend(found)
+                    if len(found) < 5:
+                        break   # last page
+                    time.sleep(PAGE_DELAY)
+                    continue
+            except Exception as e:
+                print(f"    ⚠ Next.js parse failed: {e}")
+
+        # Strategy 2: any script tag containing JSON with address keys
+        for script in soup.find_all("script"):
+            src = script.string or ""
+            if len(src) > 300 and "address" in src and "price" in src:
+                for m in re.finditer(r"(\[\s*\{.*?\}\s*\])", src, re.DOTALL):
+                    try:
+                        candidate = json.loads(m.group(1))
+                        if isinstance(candidate, list) and candidate:
+                            found = _listings_from_crexi_json(
+                                {"props": {"pageProps": {"properties": candidate}}},
+                                prop_type
+                            )
+                            if found:
+                                print(f"    ✓ script JSON → {len(found)} listings")
+                                listings.extend(found)
+                    except Exception:
+                        pass
+
+        # Strategy 3: HTML card parsing
+        html_found = _listings_from_crexi_html(soup, prop_type)
+        if html_found:
+            print(f"    ✓ HTML cards → {len(html_found)} listings")
+            listings.extend(html_found)
+
+        if not listings and page == 1:
+            print("    ⚠ no listings found on page 1 — stopping")
+            break
+
+        time.sleep(PAGE_DELAY)
 
     return listings
 
 
-# ── PSF calculation ───────────────────────────────────────────────────────────
+# ── LoopNet scraping ──────────────────────────────────────────────────────────
+
+def _infer_prop_type(text: str) -> str:
+    t = text.lower()
+    if any(w in t for w in ("land", " lot", "acre", "tract", "vacant")):
+        return "land"
+    if any(w in t for w in ("flex", "industrial", "warehouse", "distribution", "manufacturing")):
+        return "flex industrial"
+    return "commercial"
+
+
+def _listings_from_loopnet_html(soup: BeautifulSoup) -> list[Listing]:
+    selectors = [
+        ".placard", ".property-row", "[data-testid='property-card']",
+        ".listing-row", ".srp-item", "article.property",
+    ]
+    cards = []
+    for sel in selectors:
+        cards = soup.select(sel)
+        if cards:
+            break
+
+    out = []
+    for card in cards:
+        try:
+            name_el = (card.select_one(".placard-content-title") or
+                       card.select_one("h3, h4, [class*='title']"))
+            name = name_el.get_text(strip=True) if name_el else ""
+
+            addr_el = (card.select_one(".placard-content-address") or
+                       card.select_one(".property-address, .address, [itemprop='streetAddress']"))
+            addr_raw = addr_el.get_text(strip=True) if addr_el else ""
+
+            price_el = (card.select_one("[class*='price'], .dollar-amount"))
+            price_text = price_el.get_text(strip=True) if price_el else ""
+
+            size_el = card.select_one("[class*='sqft'], [class*='size'], [class*='sf']")
+            size_text = size_el.get_text(strip=True) if size_el else ""
+
+            link = card.select_one("a[href]")
+            href = link["href"] if link else ""
+            if href and not href.startswith("http"):
+                href = f"https://www.loopnet.com{href}"
+
+            price = _parse_price(price_text)
+            sqft  = _parse_sqft(size_text)
+            psf   = round(price / sqft, 2) if (price and sqft and sqft > 0) else None
+
+            city = "San Antonio"
+            zip_code = ""
+            clean_addr = addr_raw
+            parts = addr_raw.split(",")
+            if len(parts) >= 2:
+                clean_addr = parts[0].strip()
+                rest = ",".join(parts[1:])
+                cm = re.match(r"\s*(.+?)\s+(TX|Texas)", rest, re.IGNORECASE)
+                if cm:
+                    city = cm.group(1).strip()
+            zm = re.search(r"\b(\d{5})\b", addr_raw)
+            if zm:
+                zip_code = zm.group(1)
+
+            if not name and not clean_addr:
+                continue
+
+            prop_type = _infer_prop_type(name + " " + clean_addr)
+
+            out.append(Listing(
+                listing_name   = name,
+                address        = clean_addr,
+                city           = city,
+                state          = "TX",
+                zip_code       = zip_code,
+                price          = price,
+                total_sqft     = sqft,
+                price_per_sqft = psf,
+                property_type  = prop_type,
+                listing_source = "LoopNet",
+                listing_url    = href,
+            ))
+        except Exception:
+            continue
+
+    return out
+
+
+def _listings_from_json_ld(soup: BeautifulSoup, platform: str) -> list[Listing]:
+    """Extract any JSON-LD structured data (ItemList, RealEstateListing, etc.)."""
+    out = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            items = []
+            if isinstance(data, dict):
+                if data.get("@type") == "ItemList":
+                    items = data.get("itemListElement", [])
+                elif data.get("@type") in ("RealEstateListing", "Product"):
+                    items = [data]
+            elif isinstance(data, list):
+                items = data
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                thing = item.get("item", item)
+                name = str(thing.get("name", "")).strip()
+                addr_obj = thing.get("address", {})
+                if isinstance(addr_obj, dict):
+                    addr = str(addr_obj.get("streetAddress", "")).strip()
+                    city = str(addr_obj.get("addressLocality", "San Antonio")).strip()
+                    zip_code = str(addr_obj.get("postalCode", "")).strip()
+                else:
+                    addr = str(addr_obj).strip()
+                    city = "San Antonio"
+                    zip_code = ""
+                price_raw = thing.get("price") or (thing.get("offers") or {}).get("price")
+                price = _parse_price(str(price_raw)) if price_raw else None
+                url = str(thing.get("url", "")).strip()
+
+                if not name and not addr:
+                    continue
+
+                out.append(Listing(
+                    listing_name   = name[:120],
+                    address        = addr[:120],
+                    city           = city,
+                    state          = "TX",
+                    zip_code       = zip_code[:10],
+                    price          = price,
+                    property_type  = _infer_prop_type(name + " " + addr),
+                    listing_source = platform,
+                    listing_url    = url[:300],
+                ))
+        except Exception:
+            continue
+
+    return out
+
+
+def scrape_loopnet(session: requests.Session, target: dict) -> list[Listing]:
+    url      = target["url"].rstrip("/") + "/"
+    listings = []
+
+    for page in range(1, MAX_PAGES + 1):
+        page_url = url if page == 1 else f"{url}{page}/"
+        print(f"    page {page}: {page_url}")
+        sys.stdout.flush()
+
+        try:
+            resp = session.get(page_url, timeout=REQ_TIMEOUT)
+        except Exception as e:
+            print(f"    ✗ request error: {e}")
+            break
+
+        print(f"    HTTP {resp.status_code}  ({len(resp.text):,} bytes)")
+
+        if resp.status_code in (403, 429, 503):
+            print(f"    ✗ blocked (HTTP {resp.status_code})")
+            break
+        if resp.status_code != 200:
+            break
+
+        if ("cf-ray" in resp.headers or
+                "checking your browser" in resp.text.lower()):
+            print("    ✗ Cloudflare challenge — scraping blocked")
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        jld = _listings_from_json_ld(soup, "LoopNet")
+        if jld:
+            print(f"    ✓ JSON-LD → {len(jld)} listings")
+            listings.extend(jld)
+
+        html_found = _listings_from_loopnet_html(soup)
+        if html_found:
+            print(f"    ✓ HTML cards → {len(html_found)} listings")
+            listings.extend(html_found)
+
+        if not jld and not html_found:
+            print(f"    ⚠ no listings on page {page} — stopping")
+            break
+
+        time.sleep(PAGE_DELAY)
+
+    return listings
+
+
+# ── PSF calculation + deduplication ──────────────────────────────────────────
 
 def calculate_psf(lst: Listing) -> Listing:
     if lst.price is None:
@@ -357,253 +610,214 @@ def calculate_psf(lst: Listing) -> Listing:
     return lst
 
 
-# ── Deduplication ─────────────────────────────────────────────────────────────
-
-def _normalize_addr(addr: str) -> str:
-    addr = addr.lower().strip()
-    abbrevs = {
-        r"\bst\b": "street",   r"\bave?\b": "avenue",  r"\bblvd\b": "boulevard",
-        r"\bdr\b": "drive",    r"\brd\b":   "road",     r"\bln\b":   "lane",
-        r"\bct\b": "court",    r"\bpl\b":   "place",    r"\bpkwy\b": "parkway",
-        r"\bhwy\b": "highway", r"\bfwy\b":  "freeway",  r"\bste\b":  "suite",
-        r"\bn\b":  "north",    r"\bs\b":    "south",    r"\be\b":    "east",
-        r"\bw\b":  "west",
-    }
-    for pat, rep in abbrevs.items():
-        addr = re.sub(pat, rep, addr)
-    addr = re.sub(r"[^\w\s]", " ", addr)
-    return re.sub(r"\s+", " ", addr).strip()
-
-
-def _addr_sim(a: str, b: str) -> float:
-    return SequenceMatcher(None, _normalize_addr(a), _normalize_addr(b)).ratio()
-
-
-def _prices_close(p1: Optional[float], p2: Optional[float]) -> bool:
-    if p1 is None or p2 is None or p1 == 0 or p2 == 0:
-        return True
-    return abs(p1 - p2) / max(p1, p2) <= PRICE_TOL
-
-
 def deduplicate(listings: list[Listing]) -> tuple[list[Listing], int]:
+    def norm(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s]", " ", s)
+        return re.sub(r"\s+", " ", s)
+
+    def similar(a: str, b: str) -> float:
+        return SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+    def prices_close(p1, p2) -> bool:
+        if not p1 or not p2:
+            return True
+        return abs(p1 - p2) / max(p1, p2) <= 0.05
+
     kept: list[Listing] = []
     removed = 0
 
     for lst in listings:
-        matched = None
+        dup = None
         for k in kept:
-            if not lst.address or not k.address:
-                continue
-            if (_addr_sim(lst.address, k.address) >= ADDR_SIM_MIN
-                    and _prices_close(lst.price, k.price)):
-                matched = k
-                break
-
-        if matched is None:
-            kept.append(lst)
-        else:
+            if lst.address and k.address and similar(lst.address, k.address) >= 0.80:
+                if prices_close(lst.price, k.price):
+                    dup = k
+                    break
+        if dup:
             removed += 1
-            src = lst.listing_source
-            if src and src not in (matched.listing_source or ""):
-                if matched.also_listed_on:
-                    if src not in matched.also_listed_on:
-                        matched.also_listed_on += f", {src}"
-                else:
-                    matched.also_listed_on = src
-            for fname, fval in vars(lst).items():
-                if fname in ("listing_source", "also_listed_on",
-                             "deal_type", "deal_type_reason", "flag"):
+            for f in vars(lst):
+                if f in ("listing_source", "deal_type", "deal_type_reason", "flag"):
                     continue
-                if getattr(matched, fname) in (None, "", 0):
-                    setattr(matched, fname, fval)
+                if getattr(dup, f) in (None, "", 0):
+                    setattr(dup, f, getattr(lst, f))
+        else:
+            kept.append(lst)
 
     return kept, removed
 
 
-# ── Deal classification ───────────────────────────────────────────────────────
+# ── Claude batch classification (ONE API call) ────────────────────────────────
 
-def classify_deal(lst: Listing) -> Listing:
-    ptype = lst.property_type.lower()
+RULES = f"""
+CLASSIFICATION RULES (current year = {CURRENT_YEAR}, apply first match):
+1. DEVELOPMENT  — property_type is "land"
+2. DEVELOPMENT  — year_built is null AND total_sqft is null
+3. UNKNOWN      — year_built is null AND total_sqft is not null  (building exists, age unknown)
+4. UNKNOWN      — year_built present AND ({CURRENT_YEAR} - year_built) < 10  (too new)
+5. VALUE-ADD    — year_built present AND age ≥ 10 AND
+                  (lot_size_acres is null OR total_sqft/(lot_size_acres*43560) > 0.50)
+6. DEVELOPMENT  — year_built present AND age ≥ 10 AND lot_size_acres present AND
+                  total_sqft/(lot_size_acres*43560) ≤ 0.50  (≥50% undeveloped site)
+7. UNKNOWN      — anything else with insufficient data
 
-    if ptype == "land":
-        lst.deal_type        = "DEVELOPMENT"
-        lst.deal_type_reason = "Vacant land parcel — classified as development opportunity"
-        return lst
-
-    age = (CURRENT_YEAR - lst.year_built) if lst.year_built else None
-
-    site_coverage = None
-    if lst.total_sqft and lst.lot_size_acres and lst.lot_size_acres > 0:
-        site_coverage = lst.total_sqft / (lst.lot_size_acres * SQF_PER_ACRE)
-
-    if lst.year_built is None and lst.total_sqft is None:
-        lst.deal_type        = "DEVELOPMENT"
-        lst.deal_type_reason = "No year-built or building sqft — likely vacant or land-only"
-        return lst
-
-    if age is not None and age < VALUE_ADD_MIN_AGE:
-        lst.deal_type        = "UNKNOWN"
-        lst.deal_type_reason = (f"Structure is only {age} yr(s) old; VALUE-ADD requires "
-                                f"≥{VALUE_ADD_MIN_AGE} yrs — may be new construction")
-        return lst
-
-    if age is not None and age >= VALUE_ADD_MIN_AGE:
-        if site_coverage is None:
-            lst.deal_type        = "UNKNOWN"
-            lst.deal_type_reason = (f"Structure is {age} yrs old (qualifies), but lot-size "
-                                    "data unavailable to verify < 50% undeveloped rule")
-        elif site_coverage > (1 - SITE_UNCOV_MAX):
-            lst.deal_type        = "VALUE-ADD"
-            lst.deal_type_reason = (f"Structure {age} yrs old; building covers "
-                                    f"~{site_coverage*100:.0f}% of site (< 50% undeveloped)")
-        else:
-            undev_pct = (1 - site_coverage) * 100
-            lst.deal_type        = "DEVELOPMENT"
-            lst.deal_type_reason = (f"Structure {age} yrs old but ~{undev_pct:.0f}% of site "
-                                    "is undeveloped (≥ 50% threshold)")
-        return lst
-
-    if lst.total_sqft:
-        lst.deal_type        = "UNKNOWN"
-        lst.deal_type_reason = ("Building sqft present but year built unknown — "
-                                "cannot confirm ≥10-yr VALUE-ADD age requirement")
-    else:
-        lst.deal_type        = "DEVELOPMENT"
-        lst.deal_type_reason = "No year built and no building sqft — likely vacant"
-
-    return lst
+FLAGGING RULES (compute category averages across the full batch first):
+  thresholds : VALUE-ADD = ${VA_PSF_THRESHOLD:.0f}/sqft,  non-VALUE-ADD = ${DEV_PSF_THRESHOLD:.0f}/sqft
+  STRONG BUY : price_per_sqft ≤ threshold  AND  ≥ 10% below category average
+  BELOW AVG  : price_per_sqft > threshold  AND  ≥ 10% below category average
+  WATCH      : price_per_sqft ≤ threshold  AND  < 10% below category average
+  (blank)    : none of the above, or price_per_sqft is null
+"""
 
 
-# ── Flagging ──────────────────────────────────────────────────────────────────
+def classify_with_claude(client: anthropic.Anthropic,
+                         listings: list[Listing]) -> list[Listing]:
+    if not listings:
+        return listings
 
-def apply_flags(listings: list[Listing], verbose: bool = True) -> list[Listing]:
-    va_psf  = [l.price_per_sqft for l in listings
-               if l.deal_type == "VALUE-ADD"  and l.price_per_sqft]
-    dev_psf = [l.price_per_sqft for l in listings
-               if l.deal_type != "VALUE-ADD"  and l.price_per_sqft]
+    print(f"  Sending {len(listings)} listings to Claude for batch classification …")
+    sys.stdout.flush()
 
-    va_avg  = sum(va_psf)  / len(va_psf)  if va_psf  else None
-    dev_avg = sum(dev_psf) / len(dev_psf) if dev_psf else None
+    batch = [
+        {
+            "index":          i,
+            "listing_name":   l.listing_name,
+            "address":        l.address,
+            "price":          l.price,
+            "total_sqft":     l.total_sqft,
+            "price_per_sqft": l.price_per_sqft,
+            "year_built":     l.year_built,
+            "lot_size_acres": l.lot_size_acres,
+            "property_type":  l.property_type,
+        }
+        for i, l in enumerate(listings)
+    ]
 
-    if verbose:
-        print(f"  VALUE-ADD avg $/sqft:        "
-              f"{'${:.2f}'.format(va_avg)  if va_avg  else 'n/a'} "
-              f"(n={len(va_psf)})")
-        print(f"  DEVELOPMENT avg $/sqft:      "
-              f"{'${:.2f}'.format(dev_avg) if dev_avg else 'n/a'} "
-              f"(n={len(dev_psf)})")
+    prompt = f"""You are a commercial real estate analyst.
 
-    for lst in listings:
-        psf = lst.price_per_sqft
-        if psf is None:
-            lst.flag = ""
-            continue
+{RULES}
 
-        is_va        = (lst.deal_type == "VALUE-ADD")
-        threshold    = VA_PSF_THRESHOLD if is_va else DEV_PSF_THRESHOLD
-        avg          = va_avg           if is_va else dev_avg
+LISTINGS:
+{json.dumps(batch, indent=2)}
 
-        at_threshold = psf <= threshold
-        below_avg    = (avg is not None and psf <= avg * (1 - BELOW_AVG_PCT))
+Return ONLY a valid JSON array — no markdown, no explanation:
+[
+  {{"index": 0, "deal_type": "VALUE-ADD", "deal_type_reason": "30 yr old structure covers 68% of site", "flag": "WATCH"}},
+  {{"index": 1, "deal_type": "DEVELOPMENT", "deal_type_reason": "vacant land parcel", "flag": "STRONG BUY"}},
+  ...
+]"""
 
-        if at_threshold and below_avg:
-            lst.flag = "STRONG BUY"
-        elif below_avg:
-            lst.flag = "BELOW AVG"
-        elif at_threshold:
-            lst.flag = "WATCH"
-        else:
-            lst.flag = ""
+    t0 = time.time()
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=4000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    elapsed = time.time() - t0
+    result_text = response.content[0].text if response.content else ""
+    print(f"  Claude responded in {elapsed:.1f}s  ({len(result_text)} chars)")
+
+    # Extract JSON array
+    arr = None
+    m = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", result_text)
+    if m:
+        try:
+            arr = json.loads(m.group(1))
+        except Exception:
+            pass
+    if arr is None:
+        start = result_text.find("[")
+        if start >= 0:
+            depth = 0
+            for i, ch in enumerate(result_text[start:], start):
+                if ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            arr = json.loads(result_text[start : i + 1])
+                        except Exception:
+                            pass
+                        break
+
+    if not arr:
+        print("  ⚠ Could not parse Claude's response — deal_type left blank")
+        return listings
+
+    for item in arr:
+        idx = item.get("index")
+        if idx is not None and 0 <= int(idx) < len(listings):
+            listings[int(idx)].deal_type        = item.get("deal_type", "UNKNOWN")
+            listings[int(idx)].deal_type_reason = item.get("deal_type_reason", "")
+            listings[int(idx)].flag             = item.get("flag", "")
 
     return listings
-
-
-# ── Checkpoint (partial save after each call) ─────────────────────────────────
-
-def _checkpoint(raw: list[Listing], call_num: int, total_calls: int):
-    listings = [calculate_psf(l) for l in raw]
-    listings, dupes = deduplicate(listings)
-    listings = [classify_deal(l) for l in listings]
-    listings = apply_flags(listings, verbose=False)
-    export_excel(listings, EXCEL_PATH, dupes)
-    print(f"      💾 Checkpoint → {EXCEL_PATH}  "
-          f"({len(listings)} listing(s), call {call_num}/{total_calls} done)")
-    sys.stdout.flush()
 
 
 # ── Excel export ──────────────────────────────────────────────────────────────
 
 COLUMNS = [
-    ("Listing Name",        "listing_name",      28),
-    ("Address",             "address",           24),
-    ("City",                "city",              14),
-    ("State",               "state",              6),
-    ("Zip Code",            "zip_code",           9),
-    ("Price",               "price",             14),
-    ("Total Sqft",          "total_sqft",        12),
-    ("Price / Sqft",        "price_per_sqft",    12),
-    ("Year Built",          "year_built",        10),
-    ("Lot Size (Acres)",    "lot_size_acres",    14),
-    ("Zoning",              "zoning",            10),
-    ("Days on Market",      "days_on_market",    13),
-    ("Property Type",       "property_type",     18),
-    ("Listing Source",      "listing_source",    14),
-    ("Also Listed On",      "also_listed_on",    16),
-    ("Listing URL",         "listing_url",       42),
-    ("Deal Type",           "deal_type",         13),
-    ("Deal Type Reason",    "deal_type_reason",  46),
-    ("FLAG",                "flag",              12),
+    ("Listing Name",        "listing_name",       28),
+    ("Address",             "address",            24),
+    ("City",                "city",               14),
+    ("State",               "state",               6),
+    ("Zip Code",            "zip_code",            9),
+    ("Price",               "price",              14),
+    ("Total Sqft",          "total_sqft",         12),
+    ("Price / Sqft",        "price_per_sqft",     12),
+    ("Year Built",          "year_built",         10),
+    ("Lot Size (Acres)",    "lot_size_acres",     14),
+    ("Zoning",              "zoning",             10),
+    ("Days on Market",      "days_on_market",     13),
+    ("Property Type",       "property_type",      18),
+    ("Source",              "listing_source",     12),
+    ("Listing URL",         "listing_url",        42),
+    ("Deal Type",           "deal_type",          13),
+    ("Deal Type Reason",    "deal_type_reason",   46),
+    ("FLAG",                "flag",               12),
 ]
 
-C_HDR_BG  = "1F3864"
-C_VA_BG   = "E2EFDA"
-C_DEV_BG  = "DDEBF7"
-C_UNK_BG  = "FFF2CC"
-C_SB_BG   = "C00000"
-C_BA_BG   = "ED7D31"
-C_WA_BG   = "FFE699"
-THIN_SIDE = Side(style="thin", color="D9D9D9")
-THIN_BORD = Border(left=THIN_SIDE, right=THIN_SIDE,
-                   top=THIN_SIDE,  bottom=THIN_SIDE)
+C_HDR  = "1F3864"
+C_VA   = "E2EFDA"
+C_DEV  = "DDEBF7"
+C_UNK  = "FFF2CC"
+C_SB   = "C00000"
+C_BA   = "ED7D31"
+C_WA   = "FFE699"
+T_SIDE = Side(style="thin", color="D9D9D9")
+T_BORD = Border(left=T_SIDE, right=T_SIDE, top=T_SIDE, bottom=T_SIDE)
 
 
-def _cell_fill(hex_color: str) -> PatternFill:
+def _fill(hex_color: str) -> PatternFill:
     return PatternFill("solid", fgColor=hex_color)
 
 
-def export_excel(listings: list[Listing], filepath: str, dupes_removed: int):
+def export_excel(listings: list[Listing], filepath: str, dupes: int):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Listings"
 
-    hdr_font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
-    for ci, (header, _, width) in enumerate(COLUMNS, 1):
-        c = ws.cell(row=1, column=ci, value=header)
-        c.font      = hdr_font
-        c.fill      = _cell_fill(C_HDR_BG)
-        c.alignment = Alignment(horizontal="center", vertical="center",
-                                wrap_text=True)
-        c.border    = THIN_BORD
-        ws.column_dimensions[get_column_letter(ci)].width = width
+    hf = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
+    for ci, (hdr, _, w) in enumerate(COLUMNS, 1):
+        c = ws.cell(row=1, column=ci, value=hdr)
+        c.font      = hf
+        c.fill      = _fill(C_HDR)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border    = T_BORD
+        ws.column_dimensions[get_column_letter(ci)].width = w
 
     ws.row_dimensions[1].height = 30
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}1"
 
-    url_col_idx = next(i for i, (_, f, _) in enumerate(COLUMNS, 1)
-                       if f == "listing_url")
+    url_ci = next(i for i, (_, f, _) in enumerate(COLUMNS, 1) if f == "listing_url")
 
     for ri, lst in enumerate(listings, 2):
-        if lst.deal_type == "VALUE-ADD":
-            row_bg = C_VA_BG
-        elif lst.deal_type == "DEVELOPMENT":
-            row_bg = C_DEV_BG
-        else:
-            row_bg = C_UNK_BG
+        row_bg = {"VALUE-ADD": C_VA, "DEVELOPMENT": C_DEV}.get(lst.deal_type, C_UNK)
 
         for ci, (_, fname, _) in enumerate(COLUMNS, 1):
             val = getattr(lst, fname, None)
-
             if fname == "price" and val is not None:
                 val = float(val)
             elif fname in ("total_sqft", "year_built", "days_on_market") and val is not None:
@@ -612,8 +826,8 @@ def export_excel(listings: list[Listing], filepath: str, dupes_removed: int):
                 val = float(val)
 
             c = ws.cell(row=ri, column=ci, value=val)
-            c.fill      = _cell_fill(row_bg)
-            c.border    = THIN_BORD
+            c.fill      = _fill(row_bg)
+            c.border    = T_BORD
             c.alignment = Alignment(vertical="top", wrap_text=True)
 
             if fname == "price" and val is not None:
@@ -626,20 +840,17 @@ def export_excel(listings: list[Listing], filepath: str, dupes_removed: int):
                 c.number_format = '#,##0'
 
             if fname == "flag":
-                if val == "STRONG BUY":
-                    c.fill = _cell_fill(C_SB_BG)
-                    c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
-                    c.alignment = Alignment(horizontal="center", vertical="center")
-                elif val == "BELOW AVG":
-                    c.fill = _cell_fill(C_BA_BG)
-                    c.font = Font(name="Calibri", bold=True, size=10)
-                    c.alignment = Alignment(horizontal="center", vertical="center")
-                elif val == "WATCH":
-                    c.fill = _cell_fill(C_WA_BG)
-                    c.font = Font(name="Calibri", bold=True, size=10)
+                styles = {
+                    "STRONG BUY": (C_SB, Font(name="Calibri", bold=True, color="FFFFFF", size=10)),
+                    "BELOW AVG":  (C_BA, Font(name="Calibri", bold=True, size=10)),
+                    "WATCH":      (C_WA, Font(name="Calibri", bold=True, size=10)),
+                }
+                if val in styles:
+                    c.fill      = _fill(styles[val][0])
+                    c.font      = styles[val][1]
                     c.alignment = Alignment(horizontal="center", vertical="center")
 
-            if ci == url_col_idx and val and str(val).startswith("http"):
+            if ci == url_ci and val and str(val).startswith("http"):
                 c.hyperlink = str(val)
                 c.font      = Font(name="Calibri", color="0563C1",
                                    underline="single", size=10)
@@ -648,229 +859,183 @@ def export_excel(listings: list[Listing], filepath: str, dupes_removed: int):
 
     # Summary sheet
     ss = wb.create_sheet("Summary")
-    ss.column_dimensions["A"].width = 30
+    ss.column_dimensions["A"].width = 32
     ss.column_dimensions["B"].width = 16
 
-    def ss_hdr(row, text):
+    def sh(row, text):
         c = ss.cell(row=row, column=1, value=text)
-        c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
-        c.fill = _cell_fill(C_HDR_BG)
+        c.font      = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+        c.fill      = _fill(C_HDR)
         c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        ss.merge_cells(start_row=row, start_column=1,
-                       end_row=row,   end_column=2)
+        ss.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
         ss.row_dimensions[row].height = 20
 
-    def ss_row(row, label, value):
+    def sr(row, label, value):
         a = ss.cell(row=row, column=1, value=label)
         b = ss.cell(row=row, column=2, value=value)
-        a.font = Font(name="Calibri", size=10)
-        b.font = Font(name="Calibri", size=10, bold=True)
+        a.font      = Font(name="Calibri", size=10)
+        b.font      = Font(name="Calibri", size=10, bold=True)
         b.alignment = Alignment(horizontal="right")
-        for c in (a, b):
-            c.border = THIN_BORD
+        for x in (a, b):
+            x.border = T_BORD
 
     total = len(listings)
-    va_n  = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
-    dev_n = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
-    unk_n = sum(1 for l in listings if l.deal_type == "UNKNOWN")
-    sb_n  = sum(1 for l in listings if l.flag == "STRONG BUY")
-    ba_n  = sum(1 for l in listings if l.flag == "BELOW AVG")
-    wa_n  = sum(1 for l in listings if l.flag == "WATCH")
+    va  = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
+    dev = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
+    unk = sum(1 for l in listings if l.deal_type == "UNKNOWN")
+    sb  = sum(1 for l in listings if l.flag == "STRONG BUY")
+    ba  = sum(1 for l in listings if l.flag == "BELOW AVG")
+    wa  = sum(1 for l in listings if l.flag == "WATCH")
 
     r = 1
-    ss_hdr(r, "PropScout V2 Phase 1 — SA Metro Summary"); r += 1
-    ss_hdr(r, "Run info"); r += 1
-    ss_row(r, "Report date", datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
-    ss_row(r, "Geography", "San Antonio TX metro + suburbs"); r += 1
-    ss_hdr(r, "Listing counts"); r += 1
-    ss_row(r, "Total unique listings", total); r += 1
-    ss_row(r, "Duplicates removed", dupes_removed); r += 1
-    ss_hdr(r, "Deal type breakdown"); r += 1
-    ss_row(r, "VALUE-ADD",   va_n);  r += 1
-    ss_row(r, "DEVELOPMENT", dev_n); r += 1
-    ss_row(r, "UNKNOWN",     unk_n); r += 1
-    ss_hdr(r, "Flagged listings"); r += 1
-    ss_row(r, "STRONG BUY",  sb_n); r += 1
-    ss_row(r, "BELOW AVG",   ba_n); r += 1
-    ss_row(r, "WATCH",       wa_n); r += 1
-    ss_hdr(r, "By platform"); r += 1
-    for platform in PLATFORMS:
-        primary = sum(1 for l in listings if l.listing_source == platform)
-        cross   = sum(1 for l in listings if platform in (l.also_listed_on or ""))
-        ss_row(r, f"{platform}  (primary | cross-listed)",
-               f"{primary} | {cross}"); r += 1
-    ss_hdr(r, "By property type"); r += 1
-    for pt in PROPERTY_TYPES:
-        ss_row(r, pt.title(),
-               sum(1 for l in listings if l.property_type == pt)); r += 1
+    sh(r, "PropScout V2 Phase 1 — SA Metro Summary");    r += 1
+    sh(r, "Run info");                                     r += 1
+    sr(r, "Report date",  datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
+    sr(r, "Geography",    "San Antonio TX metro");         r += 1
+    sh(r, "Listing counts");                               r += 1
+    sr(r, "Total unique listings", total);                 r += 1
+    sr(r, "Duplicates removed",    dupes);                 r += 1
+    sh(r, "Deal type breakdown");                          r += 1
+    sr(r, "VALUE-ADD",   va);   r += 1
+    sr(r, "DEVELOPMENT", dev);  r += 1
+    sr(r, "UNKNOWN",     unk);  r += 1
+    sh(r, "Flagged listings");                             r += 1
+    sr(r, "STRONG BUY",  sb);   r += 1
+    sr(r, "BELOW AVG",   ba);   r += 1
+    sr(r, "WATCH",       wa);   r += 1
+    sh(r, "By platform");                                  r += 1
+    for platform in ("Crexi", "LoopNet"):
+        n = sum(1 for l in listings if l.listing_source == platform)
+        sr(r, platform, n);                                r += 1
 
     wb.save(filepath)
 
 
 # ── Terminal summary ──────────────────────────────────────────────────────────
 
-def print_summary(listings: list[Listing], dupes_removed: int, filepath: str):
-    W = 62
-
-    def hr(c="─"):
-        print(c * W)
+def print_summary(listings: list[Listing], dupes: int,
+                  excel_path: str, json_path: str):
+    W  = 62
+    hr = lambda c="─": print(c * W)
 
     total = len(listings)
-    va_n  = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
-    dev_n = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
-    unk_n = sum(1 for l in listings if l.deal_type == "UNKNOWN")
-    sb_n  = sum(1 for l in listings if l.flag == "STRONG BUY")
-    ba_n  = sum(1 for l in listings if l.flag == "BELOW AVG")
-    wa_n  = sum(1 for l in listings if l.flag == "WATCH")
+    va    = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
+    dev   = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
+    unk   = sum(1 for l in listings if l.deal_type == "UNKNOWN")
+    sb    = sum(1 for l in listings if l.flag == "STRONG BUY")
+    ba    = sum(1 for l in listings if l.flag == "BELOW AVG")
+    wa    = sum(1 for l in listings if l.flag == "WATCH")
 
-    print()
-    hr("═")
+    print(); hr("═")
     print("  PROPSCOUT V2 PHASE 1 — FINAL SUMMARY".center(W))
     hr("═")
-    print(f"  Total unique listings:       {total}")
-    print(f"  Duplicates removed:          {dupes_removed}")
+    print(f"  Total unique listings:     {total}")
+    print(f"  Duplicates removed:        {dupes}")
     hr()
     print("  DEAL TYPE BREAKDOWN")
-    print(f"    VALUE-ADD:                 {va_n}")
-    print(f"    DEVELOPMENT:               {dev_n}")
-    print(f"    UNKNOWN:                   {unk_n}")
+    print(f"    VALUE-ADD:               {va}")
+    print(f"    DEVELOPMENT:             {dev}")
+    print(f"    UNKNOWN:                 {unk}")
     hr()
     print("  FLAGGED LISTINGS")
-    print(f"    STRONG BUY  (≤threshold & ≥10% below avg):  {sb_n}")
-    print(f"    BELOW AVG   (≥10% below category avg):      {ba_n}")
-    print(f"    WATCH       (≤threshold only):              {wa_n}")
+    print(f"    STRONG BUY:              {sb}")
+    print(f"    BELOW AVG:               {ba}")
+    print(f"    WATCH:                   {wa}")
     hr()
     print("  BY PLATFORM")
-    for p in PLATFORMS:
-        pri   = sum(1 for l in listings if l.listing_source == p)
-        cross = sum(1 for l in listings if p in (l.also_listed_on or ""))
-        print(f"    {p:<12}  primary={pri:<4} cross-listed={cross}")
+    for p in ("Crexi", "LoopNet"):
+        n = sum(1 for l in listings if l.listing_source == p)
+        print(f"    {p:<14} {n} listings")
     hr()
-    print("  BY PROPERTY TYPE")
-    for pt in PROPERTY_TYPES:
-        n = sum(1 for l in listings if l.property_type == pt)
-        print(f"    {pt:<26} {n}")
-    hr()
-    if sb_n or ba_n or wa_n:
+    if sb or ba or wa:
         print("  FLAGGED LISTING DETAILS")
         for lst in listings:
             if lst.flag:
                 addr = f"{lst.address}, {lst.city}"[:40]
-                psf  = (f"${lst.price_per_sqft:.2f}/sqft"
-                        if lst.price_per_sqft else "no PSF")
+                psf  = f"${lst.price_per_sqft:.2f}/sqft" if lst.price_per_sqft else "no PSF"
                 print(f"    [{lst.flag:<10}] {addr:<42} {psf}")
         hr()
     hr("═")
-    print(f"  Excel saved → {filepath}")
-    hr("═")
-    print()
+    print(f"  Excel  → {excel_path}")
+    print(f"  JSON   → {json_path}")
+    hr("═"); print()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    W = 62
+    W  = 62
+    hr = lambda c="─": print(c * W)
 
-    def hr(c="─"):
-        print(c * W)
-
-    print()
+    print(); hr("═")
+    print("  PropScout V2 — Scraper + Claude Classifier".center(W))
     hr("═")
-    print("  PropScout V2 Phase 1 — SA Metro Commercial Scraper".center(W))
-    hr("═")
-    print(f"  Platforms:    {', '.join(PLATFORMS)}")
-    print(f"  Types:        {', '.join(PROPERTY_TYPES)}")
-    print(f"  Cities:       {len(METRO_CITIES)} metro cities")
-    total_calls = len(PLATFORMS) * len(PROPERTY_TYPES)
-    print(f"  API calls:    {total_calls} ({len(PLATFORMS)} platforms × "
-          f"{len(PROPERTY_TYPES)} property types)")
-    print(f"  Max searches: {MAX_SEARCHES} per call  |  Timeout: {CALL_TIMEOUT}s per call")
-    print(f"  Est. runtime: ~5–10 minutes")
-    hr()
-    print()
+    print("  Scraping:  Crexi (industrial + land)  ·  LoopNet (commercial)")
+    print("  API calls: 1  (Claude batch classification)")
+    print(f"  Output:    {EXCEL_PATH}  ·  {RAW_JSON}")
+    hr(); print()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("ERROR: ANTHROPIC_API_KEY not set.")
         sys.exit(1)
 
-    client = anthropic.Anthropic(api_key=api_key)
-    signal.signal(signal.SIGALRM, _timeout_handler)
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
+    # ── Step 1: Scrape ────────────────────────────────────────────────────────
     all_raw: list[Listing] = []
-    run = 0
 
-    for platform in PLATFORMS:
-        for prop_type in PROPERTY_TYPES:
-            run += 1
-            print(f"  [{run}/{total_calls}] {platform} · {prop_type}")
-            sys.stdout.flush()
-
-            signal.alarm(CALL_TIMEOUT)
-            try:
-                results = search_platform(client, platform, prop_type)
-            except _CallTimeout:
-                print(f"      ✗ Timed out after {CALL_TIMEOUT}s — skipping to next call")
-                results = []
-            except anthropic.BadRequestError as exc:
-                msg = str(exc)
-                if "credit" in msg.lower():
-                    print(f"      ✗ Insufficient credits — add credits at "
-                          "console.anthropic.com and re-run")
-                    signal.alarm(0)
-                    break
-                print(f"      ✗ BadRequestError: {exc}")
-                results = []
-            except Exception as exc:
-                print(f"      ✗ Error: {exc}")
-                results = []
-            finally:
-                signal.alarm(0)
-
-            print(f"      → {len(results)} listing(s) extracted")
-            sys.stdout.flush()
+    for target in SCRAPE_TARGETS:
+        print(f"\n── {target['platform']} · {target['prop_type']} ──────────────")
+        try:
+            if target["platform"] == "Crexi":
+                results = scrape_crexi(session, target)
+            else:
+                results = scrape_loopnet(session, target)
+            print(f"  → {len(results)} listing(s) scraped")
             all_raw.extend(results)
+        except Exception as e:
+            print(f"  ✗ scrape error: {e}")
 
-            # Checkpoint: save incrementally after each call
-            if all_raw:
-                _checkpoint(all_raw, run, total_calls)
-
-            if run < total_calls:
-                time.sleep(INTER_CALL_PAUSE)
-
-    print()
-    print(f"  Raw listings before final dedup: {len(all_raw)}")
+    print(f"\n  Total raw listings scraped: {len(all_raw)}")
     hr()
 
     if not all_raw:
-        print("  No listings found. Check API key and network, then retry.")
+        print("  No listings scraped — both platforms may be blocking requests.")
+        print("  Try running with a residential IP or adding session cookies.")
         sys.exit(0)
 
-    # Final processing pass
-    listings = [calculate_psf(l) for l in all_raw]
-
-    print("  Running deduplication …")
-    listings, dupes_removed = deduplicate(listings)
-    print(f"  Duplicates removed: {dupes_removed}")
-    print(f"  Unique listings:    {len(listings)}")
+    # ── Step 2: PSF + dedup ───────────────────────────────────────────────────
+    all_raw = [calculate_psf(l) for l in all_raw]
+    listings, dupes = deduplicate(all_raw)
+    print(f"  Dedup: {dupes} removed  |  {len(listings)} unique")
     hr()
 
-    print("  Classifying deals …")
-    listings = [classify_deal(l) for l in listings]
-    va_n  = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
-    dev_n = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
-    unk_n = sum(1 for l in listings if l.deal_type == "UNKNOWN")
-    print(f"  VALUE-ADD={va_n}  DEVELOPMENT={dev_n}  UNKNOWN={unk_n}")
+    # ── Step 3: Save raw JSON (before Claude) ─────────────────────────────────
+    raw_dicts = []
+    for l in listings:
+        d = {f: getattr(l, f) for f in vars(l) if getattr(l, f) not in (None, "", 0)}
+        raw_dicts.append(d)
+    with open(RAW_JSON, "w", encoding="utf-8") as fh:
+        json.dump(raw_dicts, fh, indent=2, default=str)
+    print(f"  Raw JSON saved → {RAW_JSON}  ({len(raw_dicts)} records)")
     hr()
 
-    print("  Applying price/sqft flags …")
-    listings = apply_flags(listings, verbose=True)
+    # ── Step 4: One Claude call — classify + flag ─────────────────────────────
+    client   = anthropic.Anthropic(api_key=api_key)
+    listings = classify_with_claude(client, listings)
+    va  = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
+    dev = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
+    unk = sum(1 for l in listings if l.deal_type == "UNKNOWN")
+    print(f"  Deal types: VALUE-ADD={va}  DEVELOPMENT={dev}  UNKNOWN={unk}")
     hr()
 
-    print(f"  Exporting final results to {EXCEL_PATH} …")
-    export_excel(listings, EXCEL_PATH, dupes_removed)
+    # ── Step 5: Export ────────────────────────────────────────────────────────
+    print(f"  Exporting → {EXCEL_PATH} …")
+    export_excel(listings, EXCEL_PATH, dupes)
 
-    print_summary(listings, dupes_removed, EXCEL_PATH)
+    print_summary(listings, dupes, EXCEL_PATH, RAW_JSON)
 
 
 if __name__ == "__main__":
