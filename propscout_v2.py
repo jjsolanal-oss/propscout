@@ -10,6 +10,7 @@ import anthropic
 import json
 import os
 import re
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -34,22 +35,33 @@ METRO_CITIES = [
     "Universal City", "Live Oak", "Helotes", "Boerne", "Seguin", "San Marcos",
 ]
 
-CURRENT_YEAR        = datetime.now().year
-VALUE_ADD_MIN_AGE   = 10       # structure must be ≥ this many years old
-SITE_UNCOV_MAX      = 0.50     # VALUE-ADD requires < 50% undeveloped site
-SQF_PER_ACRE        = 43_560
+CURRENT_YEAR      = datetime.now().year
+VALUE_ADD_MIN_AGE = 10
+SITE_UNCOV_MAX    = 0.50
+SQF_PER_ACRE      = 43_560
 
-# Flagging thresholds
-VA_PSF_THRESHOLD    = 120.0    # $/sqft — value-add
-DEV_PSF_THRESHOLD   = 5.0      # $/sqft — land/development
-BELOW_AVG_PCT       = 0.10     # 10 % below category avg
+VA_PSF_THRESHOLD  = 120.0
+DEV_PSF_THRESHOLD = 5.0
+BELOW_AVG_PCT     = 0.10
 
-# Dedup thresholds
-ADDR_SIM_MIN        = 0.80
-PRICE_TOL           = 0.05     # 5 % price tolerance
+ADDR_SIM_MIN      = 0.80
+PRICE_TOL         = 0.05
 
-# Seconds to pause between API calls (avoid rate-limit bursts)
-INTER_CALL_PAUSE    = 10
+MAX_SEARCHES      = 30    # hard cap: web searches per API call (via max_uses)
+CALL_TIMEOUT      = 300   # 5-minute hard abort per call via SIGALRM
+INTER_CALL_PAUSE  = 5     # seconds to pause between calls
+
+EXCEL_PATH        = "propscout_sa_phase1.xlsx"
+
+
+# ── Timeout support ───────────────────────────────────────────────────────────
+
+class _CallTimeout(Exception):
+    pass
+
+def _timeout_handler(signum, frame):
+    raise _CallTimeout()
+
 
 # ── Data model ────────────────────────────────────────────────────────────────
 
@@ -62,7 +74,7 @@ class Listing:
     zip_code:         str            = ""
     price:            Optional[float] = None
     total_sqft:       Optional[float] = None
-    price_per_sqft:   Optional[float] = None   # calculated
+    price_per_sqft:   Optional[float] = None
     year_built:       Optional[int]   = None
     lot_size_acres:   Optional[float] = None
     zoning:           Optional[str]   = None
@@ -71,9 +83,9 @@ class Listing:
     listing_source:   str            = ""
     listing_url:      str            = ""
     also_listed_on:   str            = ""
-    deal_type:        str            = ""      # VALUE-ADD | DEVELOPMENT | UNKNOWN
+    deal_type:        str            = ""
     deal_type_reason: str            = ""
-    flag:             str            = ""      # STRONG BUY | BELOW AVG | WATCH | ""
+    flag:             str            = ""
 
 
 # ── Search prompt ─────────────────────────────────────────────────────────────
@@ -84,18 +96,19 @@ def build_search_prompt(platform: str, prop_type: str) -> str:
     return f"""You are a commercial real estate data extraction agent.
 
 YOUR TASK: Search {platform} for {prop_type} listings FOR SALE in the San Antonio TX metro area.
+You have a maximum of {MAX_SEARCHES} web searches — use them efficiently.
 
 TARGET PLATFORM: {platform} ({platform_domain})
 PROPERTY TYPE:   {prop_type}
 GEOGRAPHY:       {cities} — all in Texas
 
-SEARCH STRATEGY (run at least 5 searches):
+SEARCH STRATEGY (use up to {MAX_SEARCHES} searches):
 1. Search {platform_domain} directly for "{prop_type} for sale San Antonio TX"
-2. Google: site:{platform_domain} "San Antonio" "{prop_type}"
-3. Google: {platform} "{prop_type}" "San Antonio" OR "Schertz" OR "New Braunfels" OR "Boerne" for sale price
-4. Search for listings in each suburb: Schertz TX, New Braunfels TX, Helotes TX, Boerne TX, Seguin TX, San Marcos TX
-5. Try broader commercial terms if specific terms fail (e.g. "industrial building for sale", "warehouse flex space")
-6. Run additional searches to reach as many listings as possible — target 8–15 listings
+2. Google: site:{platform_domain} "San Antonio" "{prop_type}" for sale
+3. Google: {platform} "{prop_type}" "San Antonio" OR "Schertz" OR "New Braunfels" price
+4. Search suburban markets: Schertz TX, Boerne TX, New Braunfels TX, San Marcos TX
+5. Try related terms if needed: "industrial building", "flex space", "warehouse"
+6. Stop searching once you have found 8–15 distinct listings or exhausted useful queries
 
 EXTRACT FOR EACH LISTING:
 - listing_name:    title or property name from the listing page
@@ -104,14 +117,14 @@ EXTRACT FOR EACH LISTING:
 - state:           TX
 - zip_code:        5-digit ZIP
 - price:           asking price as plain number (no $, no commas), null if not shown
-- total_sqft:      building square footage as plain number (for land: total lot sqft if known), null if unavailable
+- total_sqft:      building square footage as plain number, null if unavailable
 - year_built:      4-digit integer, null if unavailable
 - lot_size_acres:  lot size in decimal acres, null if unavailable
 - zoning:          zoning code or designation, null if unavailable
 - days_on_market:  integer number of days, null if unavailable
 - listing_url:     direct URL to the specific listing on {platform_domain}
 
-CRITICAL: Only include listings in these cities (TX): {cities}.
+CRITICAL: Only include listings in these Texas cities: {cities}.
 Skip any listing outside this geography.
 
 After all searches, return ONLY a JSON object (no other text, no markdown):
@@ -139,16 +152,12 @@ After all searches, return ONLY a JSON object (no other text, no markdown):
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
 def extract_json(text: str) -> Optional[dict]:
-    """Pull the first valid JSON object out of Claude's response."""
-    # Try fenced code block first
     m = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-
-    # Walk the string to find the outermost { ... }
     start = text.find("{")
     if start == -1:
         return None
@@ -187,11 +196,10 @@ def _int(val) -> Optional[int]:
         return None
 
 
-# ── Platform search (one API call) ───────────────────────────────────────────
+# ── Platform search ───────────────────────────────────────────────────────────
 
 def search_platform(client: anthropic.Anthropic,
                     platform: str, prop_type: str) -> list[Listing]:
-    """Call Claude with web_search to extract listings from one platform/type."""
     prompt   = build_search_prompt(platform, prop_type)
     messages = [{"role": "user", "content": prompt}]
 
@@ -206,10 +214,11 @@ def search_platform(client: anthropic.Anthropic,
         try:
             with client.messages.stream(
                 model=MODEL,
-                max_tokens=6000,
+                max_tokens=4000,
                 tools=[{
                     "type": "web_search_20260209",
                     "name": "web_search",
+                    "max_uses": MAX_SEARCHES,
                 }],
                 messages=messages,
             ) as stream:
@@ -221,7 +230,7 @@ def search_platform(client: anthropic.Anthropic,
                         if cb.type == "server_tool_use":
                             in_tool  = True
                             tool_buf = ""
-                        elif cb.type == "text":
+                        else:
                             in_tool = False
 
                     elif etype == "content_block_delta":
@@ -236,27 +245,29 @@ def search_platform(client: anthropic.Anthropic,
                         search_count += 1
                         try:
                             q = json.loads(tool_buf).get("query", "")
-                            print(f"      [{search_count}] {q[:70]}")
                         except Exception:
-                            pass
-                        in_tool = False
+                            q = "…"
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        print(f"      [{search_count:>2}/{MAX_SEARCHES}] {ts}  {q[:60]}")
+                        sys.stdout.flush()
+                        in_tool  = False
+                        tool_buf = ""
 
                 final = stream.get_final_message()
 
         except anthropic.RateLimitError:
-            wait = 60
-            print(f"      ⚠ Rate limit — waiting {wait}s …")
-            time.sleep(wait)
+            print("      ⚠ Rate limit — waiting 60s …")
+            sys.stdout.flush()
+            time.sleep(60)
             continue
 
         if final.stop_reason != "pause_turn":
             break
         messages.append({"role": "assistant", "content": final.content})
 
-    # ── Parse JSON ────────────────────────────────────────────────────────
     data = extract_json(full_text)
     if not data or "listings" not in data:
-        print(f"      ⚠ No parseable JSON returned")
+        print("      ⚠ No parseable JSON returned")
         return []
 
     notes = data.get("search_notes", "")
@@ -269,13 +280,9 @@ def search_platform(client: anthropic.Anthropic,
             continue
 
         city = str(raw.get("city") or "").strip()
-
-        # Geography filter
         if city and city.lower() not in metro_lower:
             if "san antonio" not in city.lower():
                 continue
-
-        # Need at least an address or a name to be useful
         if not raw.get("address") and not raw.get("listing_name"):
             continue
 
@@ -303,17 +310,13 @@ def search_platform(client: anthropic.Anthropic,
 # ── PSF calculation ───────────────────────────────────────────────────────────
 
 def calculate_psf(lst: Listing) -> Listing:
-    """Compute price_per_sqft; for land use lot acres → sqft if needed."""
     if lst.price is None:
         return lst
-
     sqft = lst.total_sqft
     if sqft is None and lst.lot_size_acres:
         sqft = lst.lot_size_acres * SQF_PER_ACRE
-
     if sqft and sqft > 0:
         lst.price_per_sqft = round(lst.price / sqft, 2)
-
     return lst
 
 
@@ -339,23 +342,13 @@ def _addr_sim(a: str, b: str) -> float:
     return SequenceMatcher(None, _normalize_addr(a), _normalize_addr(b)).ratio()
 
 
-def _completeness(lst: Listing) -> int:
-    fields = [
-        lst.listing_name, lst.address, lst.city, lst.zip_code,
-        lst.price, lst.total_sqft, lst.year_built, lst.lot_size_acres,
-        lst.zoning, lst.days_on_market, lst.listing_url,
-    ]
-    return sum(1 for f in fields if f is not None and str(f).strip() != "")
-
-
 def _prices_close(p1: Optional[float], p2: Optional[float]) -> bool:
     if p1 is None or p2 is None or p1 == 0 or p2 == 0:
-        return True   # unknown price → can't rule out duplicate
+        return True
     return abs(p1 - p2) / max(p1, p2) <= PRICE_TOL
 
 
 def deduplicate(listings: list[Listing]) -> tuple[list[Listing], int]:
-    """Remove cross-platform duplicates. Returns (unique_list, removed_count)."""
     kept: list[Listing] = []
     removed = 0
 
@@ -373,7 +366,6 @@ def deduplicate(listings: list[Listing]) -> tuple[list[Listing], int]:
             kept.append(lst)
         else:
             removed += 1
-            # Record the additional source
             src = lst.listing_source
             if src and src not in (matched.listing_source or ""):
                 if matched.also_listed_on:
@@ -381,8 +373,6 @@ def deduplicate(listings: list[Listing]) -> tuple[list[Listing], int]:
                         matched.also_listed_on += f", {src}"
                 else:
                     matched.also_listed_on = src
-
-            # Merge any fields that the keeper is missing
             for fname, fval in vars(lst).items():
                 if fname in ("listing_source", "also_listed_on",
                              "deal_type", "deal_type_reason", "flag"):
@@ -398,54 +388,44 @@ def deduplicate(listings: list[Listing]) -> tuple[list[Listing], int]:
 def classify_deal(lst: Listing) -> Listing:
     ptype = lst.property_type.lower()
 
-    # ── Land is always DEVELOPMENT ────────────────────────────────────────
     if ptype == "land":
         lst.deal_type        = "DEVELOPMENT"
         lst.deal_type_reason = "Vacant land parcel — classified as development opportunity"
         return lst
 
-    # ── Derive building age ───────────────────────────────────────────────
     age = (CURRENT_YEAR - lst.year_built) if lst.year_built else None
 
-    # ── Derive site coverage ratio ────────────────────────────────────────
     site_coverage = None
     if lst.total_sqft and lst.lot_size_acres and lst.lot_size_acres > 0:
         site_coverage = lst.total_sqft / (lst.lot_size_acres * SQF_PER_ACRE)
 
-    # ── No structure evidence → DEVELOPMENT ──────────────────────────────
     if lst.year_built is None and lst.total_sqft is None:
         lst.deal_type        = "DEVELOPMENT"
-        lst.deal_type_reason = ("No year-built or building sqft recorded — "
-                                "likely vacant or land-only")
+        lst.deal_type_reason = "No year-built or building sqft — likely vacant or land-only"
         return lst
 
-    # ── Structure too new → UNKNOWN ───────────────────────────────────────
     if age is not None and age < VALUE_ADD_MIN_AGE:
         lst.deal_type        = "UNKNOWN"
         lst.deal_type_reason = (f"Structure is only {age} yr(s) old; VALUE-ADD requires "
                                 f"≥{VALUE_ADD_MIN_AGE} yrs — may be new construction")
         return lst
 
-    # ── Structure old enough; check site coverage ─────────────────────────
     if age is not None and age >= VALUE_ADD_MIN_AGE:
         if site_coverage is None:
             lst.deal_type        = "UNKNOWN"
             lst.deal_type_reason = (f"Structure is {age} yrs old (qualifies), but lot-size "
                                     "data unavailable to verify < 50% undeveloped rule")
         elif site_coverage > (1 - SITE_UNCOV_MAX):
-            # Building covers > 50% of site → VALUE-ADD
             lst.deal_type        = "VALUE-ADD"
             lst.deal_type_reason = (f"Structure {age} yrs old; building covers "
                                     f"~{site_coverage*100:.0f}% of site (< 50% undeveloped)")
         else:
-            # ≥ 50% of site is undeveloped → DEVELOPMENT
             undev_pct = (1 - site_coverage) * 100
             lst.deal_type        = "DEVELOPMENT"
             lst.deal_type_reason = (f"Structure {age} yrs old but ~{undev_pct:.0f}% of site "
                                     "is undeveloped (≥ 50% threshold)")
         return lst
 
-    # ── Year built missing but sqft present ──────────────────────────────
     if lst.total_sqft:
         lst.deal_type        = "UNKNOWN"
         lst.deal_type_reason = ("Building sqft present but year built unknown — "
@@ -459,22 +439,22 @@ def classify_deal(lst: Listing) -> Listing:
 
 # ── Flagging ──────────────────────────────────────────────────────────────────
 
-def apply_flags(listings: list[Listing]) -> list[Listing]:
-    """Compute category PSF averages and stamp FLAG on every listing."""
+def apply_flags(listings: list[Listing], verbose: bool = True) -> list[Listing]:
     va_psf  = [l.price_per_sqft for l in listings
-               if l.deal_type == "VALUE-ADD"   and l.price_per_sqft]
+               if l.deal_type == "VALUE-ADD"  and l.price_per_sqft]
     dev_psf = [l.price_per_sqft for l in listings
-               if l.deal_type != "VALUE-ADD"   and l.price_per_sqft]
+               if l.deal_type != "VALUE-ADD"  and l.price_per_sqft]
 
     va_avg  = sum(va_psf)  / len(va_psf)  if va_psf  else None
     dev_avg = sum(dev_psf) / len(dev_psf) if dev_psf else None
 
-    print(f"  VALUE-ADD avg $/sqft:        "
-          f"{'${:.2f}'.format(va_avg)  if va_avg  else 'n/a'} "
-          f"(n={len(va_psf)})")
-    print(f"  DEVELOPMENT avg $/sqft:      "
-          f"{'${:.2f}'.format(dev_avg) if dev_avg else 'n/a'} "
-          f"(n={len(dev_psf)})")
+    if verbose:
+        print(f"  VALUE-ADD avg $/sqft:        "
+              f"{'${:.2f}'.format(va_avg)  if va_avg  else 'n/a'} "
+              f"(n={len(va_psf)})")
+        print(f"  DEVELOPMENT avg $/sqft:      "
+              f"{'${:.2f}'.format(dev_avg) if dev_avg else 'n/a'} "
+              f"(n={len(dev_psf)})")
 
     for lst in listings:
         psf = lst.price_per_sqft
@@ -482,9 +462,9 @@ def apply_flags(listings: list[Listing]) -> list[Listing]:
             lst.flag = ""
             continue
 
-        is_va       = (lst.deal_type == "VALUE-ADD")
-        threshold   = VA_PSF_THRESHOLD  if is_va else DEV_PSF_THRESHOLD
-        avg         = va_avg            if is_va else dev_avg
+        is_va        = (lst.deal_type == "VALUE-ADD")
+        threshold    = VA_PSF_THRESHOLD if is_va else DEV_PSF_THRESHOLD
+        avg          = va_avg           if is_va else dev_avg
 
         at_threshold = psf <= threshold
         below_avg    = (avg is not None and psf <= avg * (1 - BELOW_AVG_PCT))
@@ -501,10 +481,22 @@ def apply_flags(listings: list[Listing]) -> list[Listing]:
     return listings
 
 
+# ── Checkpoint (partial save after each call) ─────────────────────────────────
+
+def _checkpoint(raw: list[Listing], call_num: int, total_calls: int):
+    listings = [calculate_psf(l) for l in raw]
+    listings, dupes = deduplicate(listings)
+    listings = [classify_deal(l) for l in listings]
+    listings = apply_flags(listings, verbose=False)
+    export_excel(listings, EXCEL_PATH, dupes)
+    print(f"      💾 Checkpoint → {EXCEL_PATH}  "
+          f"({len(listings)} listing(s), call {call_num}/{total_calls} done)")
+    sys.stdout.flush()
+
+
 # ── Excel export ──────────────────────────────────────────────────────────────
 
 COLUMNS = [
-    # (header,              field_name,         col_width)
     ("Listing Name",        "listing_name",      28),
     ("Address",             "address",           24),
     ("City",                "city",              14),
@@ -526,15 +518,13 @@ COLUMNS = [
     ("FLAG",                "flag",              12),
 ]
 
-# Palette
-C_HDR_BG  = "1F3864"   # dark navy
-C_VA_BG   = "E2EFDA"   # soft green  → VALUE-ADD rows
-C_DEV_BG  = "DDEBF7"   # soft blue   → DEVELOPMENT rows
-C_UNK_BG  = "FFF2CC"   # soft yellow → UNKNOWN rows
-C_SB_BG   = "C00000"   # red         → STRONG BUY cell
-C_BA_BG   = "ED7D31"   # orange      → BELOW AVG cell
-C_WA_BG   = "FFE699"   # pale amber  → WATCH cell
-C_ALT_BG  = "F2F2F2"   # alternating even-row tint
+C_HDR_BG  = "1F3864"
+C_VA_BG   = "E2EFDA"
+C_DEV_BG  = "DDEBF7"
+C_UNK_BG  = "FFF2CC"
+C_SB_BG   = "C00000"
+C_BA_BG   = "ED7D31"
+C_WA_BG   = "FFE699"
 THIN_SIDE = Side(style="thin", color="D9D9D9")
 THIN_BORD = Border(left=THIN_SIDE, right=THIN_SIDE,
                    top=THIN_SIDE,  bottom=THIN_SIDE)
@@ -544,15 +534,11 @@ def _cell_fill(hex_color: str) -> PatternFill:
     return PatternFill("solid", fgColor=hex_color)
 
 
-def export_excel(listings: list[Listing], filepath: str,
-                 dupes_removed: int):
+def export_excel(listings: list[Listing], filepath: str, dupes_removed: int):
     wb = openpyxl.Workbook()
-
-    # ── Main data sheet ───────────────────────────────────────────────────
     ws = wb.active
     ws.title = "Listings"
 
-    # Header
     hdr_font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
     for ci, (header, _, width) in enumerate(COLUMNS, 1):
         c = ws.cell(row=1, column=ci, value=header)
@@ -567,12 +553,10 @@ def export_excel(listings: list[Listing], filepath: str,
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}1"
 
-    # Data rows
     url_col_idx = next(i for i, (_, f, _) in enumerate(COLUMNS, 1)
                        if f == "listing_url")
 
     for ri, lst in enumerate(listings, 2):
-        # Row background by deal type
         if lst.deal_type == "VALUE-ADD":
             row_bg = C_VA_BG
         elif lst.deal_type == "DEVELOPMENT":
@@ -583,7 +567,6 @@ def export_excel(listings: list[Listing], filepath: str,
         for ci, (_, fname, _) in enumerate(COLUMNS, 1):
             val = getattr(lst, fname, None)
 
-            # Coerce for Excel types
             if fname == "price" and val is not None:
                 val = float(val)
             elif fname in ("total_sqft", "year_built", "days_on_market") and val is not None:
@@ -596,7 +579,6 @@ def export_excel(listings: list[Listing], filepath: str,
             c.border    = THIN_BORD
             c.alignment = Alignment(vertical="top", wrap_text=True)
 
-            # Number formats
             if fname == "price" and val is not None:
                 c.number_format = '$#,##0'
             elif fname == "price_per_sqft" and val is not None:
@@ -606,26 +588,20 @@ def export_excel(listings: list[Listing], filepath: str,
             elif fname == "total_sqft" and val is not None:
                 c.number_format = '#,##0'
 
-            # FLAG cell coloring
             if fname == "flag":
                 if val == "STRONG BUY":
                     c.fill = _cell_fill(C_SB_BG)
-                    c.font = Font(name="Calibri", bold=True,
-                                  color="FFFFFF", size=10)
-                    c.alignment = Alignment(horizontal="center",
-                                            vertical="center")
+                    c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
                 elif val == "BELOW AVG":
                     c.fill = _cell_fill(C_BA_BG)
                     c.font = Font(name="Calibri", bold=True, size=10)
-                    c.alignment = Alignment(horizontal="center",
-                                            vertical="center")
+                    c.alignment = Alignment(horizontal="center", vertical="center")
                 elif val == "WATCH":
                     c.fill = _cell_fill(C_WA_BG)
                     c.font = Font(name="Calibri", bold=True, size=10)
-                    c.alignment = Alignment(horizontal="center",
-                                            vertical="center")
+                    c.alignment = Alignment(horizontal="center", vertical="center")
 
-            # Hyperlink for URL column
             if ci == url_col_idx and val and str(val).startswith("http"):
                 c.hyperlink = str(val)
                 c.font      = Font(name="Calibri", color="0563C1",
@@ -633,7 +609,7 @@ def export_excel(listings: list[Listing], filepath: str,
 
         ws.row_dimensions[ri].height = 48
 
-    # ── Summary sheet ─────────────────────────────────────────────────────
+    # Summary sheet
     ss = wb.create_sheet("Summary")
     ss.column_dimensions["A"].width = 30
     ss.column_dimensions["B"].width = 16
@@ -642,8 +618,7 @@ def export_excel(listings: list[Listing], filepath: str,
         c = ss.cell(row=row, column=1, value=text)
         c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
         c.fill = _cell_fill(C_HDR_BG)
-        c.alignment = Alignment(horizontal="left", vertical="center",
-                                indent=1)
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
         ss.merge_cells(start_row=row, start_column=1,
                        end_row=row,   end_column=2)
         ss.row_dimensions[row].height = 20
@@ -657,21 +632,19 @@ def export_excel(listings: list[Listing], filepath: str,
         for c in (a, b):
             c.border = THIN_BORD
 
-    total     = len(listings)
-    va_n      = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
-    dev_n     = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
-    unk_n     = sum(1 for l in listings if l.deal_type == "UNKNOWN")
-    sb_n      = sum(1 for l in listings if l.flag == "STRONG BUY")
-    ba_n      = sum(1 for l in listings if l.flag == "BELOW AVG")
-    wa_n      = sum(1 for l in listings if l.flag == "WATCH")
+    total = len(listings)
+    va_n  = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
+    dev_n = sum(1 for l in listings if l.deal_type == "DEVELOPMENT")
+    unk_n = sum(1 for l in listings if l.deal_type == "UNKNOWN")
+    sb_n  = sum(1 for l in listings if l.flag == "STRONG BUY")
+    ba_n  = sum(1 for l in listings if l.flag == "BELOW AVG")
+    wa_n  = sum(1 for l in listings if l.flag == "WATCH")
 
     r = 1
     ss_hdr(r, "PropScout V2 Phase 1 — SA Metro Summary"); r += 1
     ss_hdr(r, "Run info"); r += 1
-    ss_row(r, "Report date",
-           datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
-    ss_row(r, "Geography",
-           "San Antonio TX metro + suburbs"); r += 1
+    ss_row(r, "Report date", datetime.now().strftime("%Y-%m-%d %H:%M")); r += 1
+    ss_row(r, "Geography", "San Antonio TX metro + suburbs"); r += 1
     ss_hdr(r, "Listing counts"); r += 1
     ss_row(r, "Total unique listings", total); r += 1
     ss_row(r, "Duplicates removed", dupes_removed); r += 1
@@ -686,8 +659,7 @@ def export_excel(listings: list[Listing], filepath: str,
     ss_hdr(r, "By platform"); r += 1
     for platform in PLATFORMS:
         primary = sum(1 for l in listings if l.listing_source == platform)
-        cross   = sum(1 for l in listings
-                      if platform in (l.also_listed_on or ""))
+        cross   = sum(1 for l in listings if platform in (l.also_listed_on or ""))
         ss_row(r, f"{platform}  (primary | cross-listed)",
                f"{primary} | {cross}"); r += 1
     ss_hdr(r, "By property type"); r += 1
@@ -775,7 +747,8 @@ def main():
     total_calls = len(PLATFORMS) * len(PROPERTY_TYPES)
     print(f"  API calls:    {total_calls} ({len(PLATFORMS)} platforms × "
           f"{len(PROPERTY_TYPES)} property types)")
-    print(f"  Est. runtime: 8–15 minutes")
+    print(f"  Max searches: {MAX_SEARCHES} per call  |  Timeout: {CALL_TIMEOUT}s per call")
+    print(f"  Est. runtime: ~5–10 minutes")
     hr()
     print()
 
@@ -785,8 +758,8 @@ def main():
         sys.exit(1)
 
     client = anthropic.Anthropic(api_key=api_key)
+    signal.signal(signal.SIGALRM, _timeout_handler)
 
-    # ── Phase 1: Search & extract ─────────────────────────────────────────
     all_raw: list[Listing] = []
     run = 0
 
@@ -794,36 +767,57 @@ def main():
         for prop_type in PROPERTY_TYPES:
             run += 1
             print(f"  [{run}/{total_calls}] {platform} · {prop_type}")
+            sys.stdout.flush()
+
+            signal.alarm(CALL_TIMEOUT)
             try:
                 results = search_platform(client, platform, prop_type)
+            except _CallTimeout:
+                print(f"      ✗ Timed out after {CALL_TIMEOUT}s — skipping to next call")
+                results = []
+            except anthropic.BadRequestError as exc:
+                msg = str(exc)
+                if "credit" in msg.lower():
+                    print(f"      ✗ Insufficient credits — add credits at "
+                          "console.anthropic.com and re-run")
+                    signal.alarm(0)
+                    break
+                print(f"      ✗ BadRequestError: {exc}")
+                results = []
             except Exception as exc:
                 print(f"      ✗ Error: {exc}")
                 results = []
+            finally:
+                signal.alarm(0)
+
             print(f"      → {len(results)} listing(s) extracted")
+            sys.stdout.flush()
             all_raw.extend(results)
+
+            # Checkpoint: save incrementally after each call
+            if all_raw:
+                _checkpoint(all_raw, run, total_calls)
 
             if run < total_calls:
                 time.sleep(INTER_CALL_PAUSE)
 
     print()
-    print(f"  Raw listings before dedup: {len(all_raw)}")
+    print(f"  Raw listings before final dedup: {len(all_raw)}")
     hr()
 
     if not all_raw:
         print("  No listings found. Check API key and network, then retry.")
         sys.exit(0)
 
-    # ── Phase 2: PSF calculation ──────────────────────────────────────────
-    all_raw = [calculate_psf(l) for l in all_raw]
+    # Final processing pass
+    listings = [calculate_psf(l) for l in all_raw]
 
-    # ── Phase 3: Deduplicate ──────────────────────────────────────────────
     print("  Running deduplication …")
-    listings, dupes_removed = deduplicate(all_raw)
+    listings, dupes_removed = deduplicate(listings)
     print(f"  Duplicates removed: {dupes_removed}")
     print(f"  Unique listings:    {len(listings)}")
     hr()
 
-    # ── Phase 4: Classify ─────────────────────────────────────────────────
     print("  Classifying deals …")
     listings = [classify_deal(l) for l in listings]
     va_n  = sum(1 for l in listings if l.deal_type == "VALUE-ADD")
@@ -832,18 +826,14 @@ def main():
     print(f"  VALUE-ADD={va_n}  DEVELOPMENT={dev_n}  UNKNOWN={unk_n}")
     hr()
 
-    # ── Phase 5: Flagging ─────────────────────────────────────────────────
     print("  Applying price/sqft flags …")
-    listings = apply_flags(listings)
+    listings = apply_flags(listings, verbose=True)
     hr()
 
-    # ── Phase 6: Export ───────────────────────────────────────────────────
-    filepath = "propscout_sa_phase1.xlsx"
-    print(f"  Exporting to {filepath} …")
-    export_excel(listings, filepath, dupes_removed)
+    print(f"  Exporting final results to {EXCEL_PATH} …")
+    export_excel(listings, EXCEL_PATH, dupes_removed)
 
-    # ── Summary ───────────────────────────────────────────────────────────
-    print_summary(listings, dupes_removed, filepath)
+    print_summary(listings, dupes_removed, EXCEL_PATH)
 
 
 if __name__ == "__main__":
