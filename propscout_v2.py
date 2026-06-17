@@ -47,8 +47,8 @@ BELOW_AVG_PCT     = 0.10
 ADDR_SIM_MIN      = 0.80
 PRICE_TOL         = 0.05
 
-MAX_SEARCHES      = 30    # hard cap: web searches per API call (via max_uses)
-CALL_TIMEOUT      = 300   # 5-minute hard abort per call via SIGALRM
+MAX_SEARCHES      = 10    # hard cap: web searches per API call
+CALL_TIMEOUT      = 180   # 3-minute hard abort per call via SIGALRM
 INTER_CALL_PAUSE  = 5     # seconds to pause between calls
 
 EXCEL_PATH        = "propscout_sa_phase1.xlsx"
@@ -96,19 +96,22 @@ def build_search_prompt(platform: str, prop_type: str) -> str:
     return f"""You are a commercial real estate data extraction agent.
 
 YOUR TASK: Search {platform} for {prop_type} listings FOR SALE in the San Antonio TX metro area.
-You have a maximum of {MAX_SEARCHES} web searches — use them efficiently.
 
 TARGET PLATFORM: {platform} ({platform_domain})
 PROPERTY TYPE:   {prop_type}
 GEOGRAPHY:       {cities} — all in Texas
 
-SEARCH STRATEGY (use up to {MAX_SEARCHES} searches):
-1. Search {platform_domain} directly for "{prop_type} for sale San Antonio TX"
-2. Google: site:{platform_domain} "San Antonio" "{prop_type}" for sale
-3. Google: {platform} "{prop_type}" "San Antonio" OR "Schertz" OR "New Braunfels" price
-4. Search suburban markets: Schertz TX, Boerne TX, New Braunfels TX, San Marcos TX
-5. Try related terms if needed: "industrial building", "flex space", "warehouse"
-6. Stop searching once you have found 8–15 distinct listings or exhausted useful queries
+!!!  HARD LIMIT: You may perform AT MOST {MAX_SEARCHES} web searches total.  !!!
+!!!  After your {MAX_SEARCHES}th search, STOP immediately and output JSON.   !!!
+DO NOT perform search #{MAX_SEARCHES + 1} or beyond under any circumstances.
+
+SEARCH PLAN (stop as soon as you have 5+ listings OR reach {MAX_SEARCHES} searches):
+1. Search {platform_domain} for "{prop_type} for sale San Antonio TX"
+2. Google: site:{platform_domain} "{prop_type}" "San Antonio"
+3. Google: {platform} "{prop_type}" "San Antonio TX" price
+4. Try one suburban city if needed: Schertz, New Braunfels, or Boerne TX
+5. One fallback with related term: "industrial" OR "flex space" OR "warehouse"
+STOP after {MAX_SEARCHES} searches — do not search further.
 
 EXTRACT FOR EACH LISTING:
 - listing_name:    title or property name from the listing page
@@ -127,7 +130,8 @@ EXTRACT FOR EACH LISTING:
 CRITICAL: Only include listings in these Texas cities: {cities}.
 Skip any listing outside this geography.
 
-After all searches, return ONLY a JSON object (no other text, no markdown):
+After completing your searches (or reaching the {MAX_SEARCHES}-search limit), return ONLY a
+JSON object (no other text, no markdown):
 {{
   "listings": [
     {{
@@ -207,19 +211,19 @@ def search_platform(client: anthropic.Anthropic,
     search_count = 0
     tool_buf     = ""
     in_tool      = False
+    hit_cap      = False
 
     metro_lower = {c.lower() for c in METRO_CITIES}
 
-    for _continuation in range(4):
+    for _continuation in range(6):
+        # After hitting the cap we run one tool-free pass to collect JSON
+        tools = [] if hit_cap else [{"type": "web_search_20260209", "name": "web_search"}]
+
         try:
             with client.messages.stream(
                 model=MODEL,
                 max_tokens=4000,
-                tools=[{
-                    "type": "web_search_20260209",
-                    "name": "web_search",
-                    "max_uses": MAX_SEARCHES,
-                }],
+                tools=tools,
                 messages=messages,
             ) as stream:
                 for event in stream:
@@ -253,7 +257,14 @@ def search_platform(client: anthropic.Anthropic,
                         in_tool  = False
                         tool_buf = ""
 
-                final = stream.get_final_message()
+                        if search_count >= MAX_SEARCHES:
+                            hit_cap = True
+                            break  # exit event loop early; get_final_message below
+
+                try:
+                    final = stream.get_final_message()
+                except Exception:
+                    final = None
 
         except anthropic.RateLimitError:
             print("      ⚠ Rate limit — waiting 60s …")
@@ -261,9 +272,35 @@ def search_platform(client: anthropic.Anthropic,
             time.sleep(60)
             continue
 
+        if hit_cap and not full_text:
+            # Stream was cut mid-search — inject context and request JSON
+            partial_content = final.content if (final and final.content) else []
+            if partial_content:
+                messages.append({"role": "assistant", "content": partial_content})
+            else:
+                messages.append({"role": "assistant",
+                                 "content": f"I performed {search_count} searches."})
+            messages.append({"role": "user",
+                             "content": (
+                                 f"You have reached the {MAX_SEARCHES}-search limit. "
+                                 "Stop all searching now. Return ONLY the JSON object with "
+                                 "every listing you found. If none were found, return "
+                                 '{"listings": [], "search_notes": "none found"}.'
+                             )})
+            continue  # next iteration: tools=[], forces plain JSON response
+
+        if final is None:
+            break
+
         if final.stop_reason != "pause_turn":
             break
+
         messages.append({"role": "assistant", "content": final.content})
+
+        if hit_cap:
+            # Already injected the JSON request above on first cap hit
+            messages.append({"role": "user",
+                             "content": "Return the JSON now. No more searches."})
 
     data = extract_json(full_text)
     if not data or "listings" not in data:
