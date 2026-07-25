@@ -209,22 +209,74 @@ def _parse_address(raw: str) -> tuple[str, str, str, str]:
 #  ROBOTS.TXT  — respect site crawling policies
 # ─────────────────────────────────────────────────────────────────────────────
 
-_robots_cache: dict[str, Optional[RobotFileParser]] = {}
+# urllib's RobotFileParser.read() is unusable here for two reasons:
+#   1. It fetches robots.txt with the "Python-urllib/3.x" user agent, which
+#      Cloudflare-fronted sites reject with a 403.
+#   2. On 401/403 it silently sets disallow_all = True instead of raising, so a
+#      *failed fetch* becomes indistinguishable from a real Disallow rule.
+# So we fetch robots.txt ourselves with the browser UA, hand the text to
+# RobotFileParser.parse(), and record what actually happened for diagnostics.
+#
+# Status handling follows RFC 9309 §2.3.1:
+#   2xx            → parse and honour the rules
+#   4xx            → no policy published; crawling permitted
+#   5xx / no reply → treat as fully disallowed (fail closed)
+
+# Product token used for robots.txt group matching. Deliberately not the full
+# browser UA: RobotFileParser reduces "Mozilla/5.0 (...)" to "mozilla", which
+# makes group matching unpredictable. A distinct token matches only "*" groups
+# or groups that name us explicitly.
+ROBOTS_UA = "PropScout"
 
 
-def _robots_allows(url: str) -> bool:
-    parsed  = urlparse(url)
-    base    = f"{parsed.scheme}://{parsed.netloc}"
-    if base not in _robots_cache:
-        rp = RobotFileParser()
-        rp.set_url(f"{base}/robots.txt")
-        try:
-            rp.read()
-            _robots_cache[base] = rp
-        except Exception:
-            _robots_cache[base] = None   # unreadable → assume allowed
-    rp = _robots_cache[base]
-    return rp is None or rp.can_fetch(USER_AGENT, url)
+@dataclass
+class RobotsInfo:
+    fetch_status: Optional[int]             = None
+    parser:       Optional[RobotFileParser] = None
+    note:         str                       = ""
+
+
+_robots_cache: dict[str, RobotsInfo] = {}
+
+
+def _get_robots(session: requests.Session, base: str) -> RobotsInfo:
+    if base in _robots_cache:
+        return _robots_cache[base]
+
+    info = RobotsInfo()
+    try:
+        resp = session.get(f"{base}/robots.txt", timeout=REQ_TIMEOUT)
+        info.fetch_status = resp.status_code
+        if resp.status_code < 300:
+            rp = RobotFileParser()
+            rp.parse(resp.text.splitlines())
+            info.parser = rp
+            info.note   = f"robots.txt OK ({resp.status_code})"
+        elif 400 <= resp.status_code < 500:
+            info.note = f"no robots.txt (HTTP {resp.status_code}) – crawling permitted"
+        else:
+            info.note = f"robots.txt HTTP {resp.status_code} – failing closed"
+    except requests.RequestException as exc:
+        info.note = f"robots.txt unreachable ({type(exc).__name__}) – failing closed"
+
+    _robots_cache[base] = info
+    return info
+
+
+def _robots_allows(session: requests.Session, url: str) -> tuple[bool, str]:
+    """Return (allowed, human-readable reason)."""
+    parsed = urlparse(url)
+    base   = f"{parsed.scheme}://{parsed.netloc}"
+    info   = _get_robots(session, base)
+
+    if info.parser is not None:
+        if info.parser.can_fetch(ROBOTS_UA, url):
+            return True, info.note
+        return False, f"robots.txt Disallow matches {parsed.path or '/'}"
+
+    if info.fetch_status is not None and 400 <= info.fetch_status < 500:
+        return True, info.note
+    return False, info.note
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,8 +408,9 @@ def _deep_find_list(obj, depth: int = 0) -> Optional[list]:
 def _safe_get(session: requests.Session,
               url: str, result: ScraperResult) -> Optional[requests.Response]:
     """GET with robots check, error capture, and status recording."""
-    if not _robots_allows(url):
-        result.error = "robots.txt disallows crawling"
+    allowed, reason = _robots_allows(session, url)
+    if not allowed:
+        result.error = reason
         return None
     try:
         resp = session.get(url, timeout=REQ_TIMEOUT)
@@ -1201,15 +1254,60 @@ def export_excel(listings: list[Listing], filepath: str,
 #  SOURCE DIAGNOSTIC TABLE
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: Representative target path per source, used by --check-robots.
+ROBOTS_PROBE_URLS = {
+    "Brevitas":           "https://brevitas.com/buy?q=San+Antonio+TX+industrial",
+    "LandBrokerMLS":      "https://www.landbrokermls.com/listings/?state_name=Texas&q=San+Antonio",
+    "CommercialExchange": "https://www.commercialexchange.com/commercial-real-estate/san-antonio-tx/industrial/for-sale/",
+    "Catylist":           "https://www.catylist.com/san-antonio-tx-commercial-real-estate/industrial/for-sale/",
+    "Land.com":           "https://www.land.com/results/Texas/San-Antonio/",
+}
+
+
+def check_robots(session: requests.Session) -> None:
+    """Probe robots.txt for every enabled source and report verbatim."""
+    W = 96
+    print()
+    print("─" * W)
+    print("  ROBOTS.TXT PROBE  (no listing pages are requested)")
+    print("─" * W)
+
+    for source, url in ROBOTS_PROBE_URLS.items():
+        if not SOURCES.get(source, False):
+            print(f"\n  {source}: [disabled]")
+            continue
+
+        parsed = urlparse(url)
+        base   = f"{parsed.scheme}://{parsed.netloc}"
+        info   = _get_robots(session, base)
+        allowed, reason = _robots_allows(session, url)
+        verdict = "ALLOWED" if allowed else "BLOCKED"
+
+        print(f"\n  {source}  →  {verdict}")
+        print(f"    robots.txt : {base}/robots.txt")
+        print(f"    fetch      : HTTP {info.fetch_status if info.fetch_status else 'no response'}")
+        print(f"    target path: {parsed.path or '/'}")
+        print(f"    reason     : {reason}")
+        time.sleep(REQUEST_DELAY)
+
+    print()
+    print("─" * W)
+    print("  BLOCKED because a Disallow rule matched = the site has asked crawlers")
+    print("  to stay out of that path. Respect it; use an official API or a data")
+    print("  licence instead. BLOCKED for any other reason is a fetch problem.")
+    print("─" * W)
+    print()
+
+
 def print_diagnostics(results: list[ScraperResult], dupes: int,
                       total_after: int) -> None:
-    W = 72
+    W = 96
     print()
     print("─" * W)
     print("  SOURCE DIAGNOSTIC TABLE")
     print("─" * W)
     print(f"  {'Source':<22} {'HTTP':>6}  {'Listings':>9}  {'Notes'}")
-    print(f"  {'─'*22} {'─'*6}  {'─'*9}  {'─'*28}")
+    print(f"  {'─'*22} {'─'*6}  {'─'*9}  {'─'*52}")
     for r in results:
         status = str(r.http_status) if r.http_status else "—"
         notes  = r.error or "OK"
@@ -1217,7 +1315,7 @@ def print_diagnostics(results: list[ScraperResult], dupes: int,
         if not SOURCES.get(r.source, True):
             src_label = f"{r.source} [disabled]"
             notes = "disabled"
-        print(f"  {src_label:<22} {status:>6}  {r.listings_found:>9}  {notes[:38]}")
+        print(f"  {src_label:<22} {status:>6}  {r.listings_found:>9}  {notes[:52]}")
     print("─" * W)
     total_raw = sum(r.listings_found for r in results)
     print(f"  Raw total: {total_raw}   Dupes removed: {dupes}   Unique: {total_after}")
@@ -1284,6 +1382,10 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="Scrape and deduplicate only; skip the Claude API call (free test)",
     )
+    parser.add_argument(
+        "--check-robots", action="store_true",
+        help="Only probe each source's robots.txt and report; scrape nothing",
+    )
     args = parser.parse_args()
 
     W  = 62
@@ -1298,7 +1400,7 @@ def main() -> None:
     print(f"  Output:    {EXCEL_PATH}  ·  {RAW_JSON}")
     hr(); print()
 
-    if not os.environ.get("ANTHROPIC_API_KEY") and not args.dry_run:
+    if not os.environ.get("ANTHROPIC_API_KEY") and not (args.dry_run or args.check_robots):
         sys.exit("ERROR: ANTHROPIC_API_KEY not set. Set it or use --dry-run.")
 
     session = requests.Session()
@@ -1314,6 +1416,10 @@ def main() -> None:
         "Sec-Fetch-Site":            "none",
         "Cache-Control":             "max-age=0",
     })
+
+    if args.check_robots:
+        check_robots(session)
+        return
 
     # ── Step 1: Scrape all enabled sources ────────────────────────────────────
     all_raw:     list[Listing]       = []
