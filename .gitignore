@@ -7,3 +7,5 @@ build/
 .env
 *.txt.bak
 propscout_*.txt
+listings_raw.json
+propscout_*.xlsx
