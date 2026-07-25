@@ -9,3 +9,7 @@ build/
 propscout_*.txt
 listings_raw.json
 propscout_*.xlsx
+
+# probe output
+sample_*.html
+sample.html
