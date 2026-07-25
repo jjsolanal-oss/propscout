@@ -56,6 +56,12 @@ EXCEL_PATH    = "propscout_sa_phase1.xlsx"
 REQUEST_DELAY = 2.0     # seconds between HTTP requests
 MAX_PAGES     = 5       # pagination cap per source
 REQ_TIMEOUT   = 20      # HTTP timeout in seconds
+
+# HTTP 429 handling. Retry-After is honoured when the server sends it;
+# otherwise back off exponentially from RATE_LIMIT_BACKOFF.
+RATE_LIMIT_RETRIES  = 3
+RATE_LIMIT_BACKOFF  = 5.0    # seconds, doubled each retry
+RATE_LIMIT_MAX_WAIT = 60.0   # ceiling on any single wait
 CURRENT_YEAR  = datetime.now().year
 
 USER_AGENT = (
@@ -246,6 +252,16 @@ def _get_robots(session: requests.Session, base: str) -> RobotsInfo:
     info = RobotsInfo()
     try:
         resp = session.get(f"{base}/robots.txt", timeout=REQ_TIMEOUT)
+        # A 429 on robots.txt would fall through to "no policy published".
+        # Retry so we read the real policy rather than assuming permission.
+        for attempt in range(RATE_LIMIT_RETRIES):
+            if resp.status_code != 429:
+                break
+            wait = min(RATE_LIMIT_BACKOFF * (2 ** attempt), RATE_LIMIT_MAX_WAIT)
+            print(f"     · 429 on {base}/robots.txt — waiting {wait:.0f}s")
+            time.sleep(wait)
+            resp = session.get(f"{base}/robots.txt", timeout=REQ_TIMEOUT)
+
         info.fetch_status = resp.status_code
         if resp.status_code < 300:
             rp = RobotFileParser()
@@ -407,22 +423,41 @@ def _deep_find_list(obj, depth: int = 0) -> Optional[list]:
 
 def _safe_get(session: requests.Session,
               url: str, result: ScraperResult) -> Optional[requests.Response]:
-    """GET with robots check, error capture, and status recording."""
+    """GET with robots check, 429 backoff, error capture, and status recording."""
     allowed, reason = _robots_allows(session, url)
     if not allowed:
         result.error = reason
         return None
-    try:
-        resp = session.get(url, timeout=REQ_TIMEOUT)
-    except requests.RequestException as exc:
-        result.error = f"Request error: {exc}"
-        return None
-    result.http_status = resp.status_code
+
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            resp = session.get(url, timeout=REQ_TIMEOUT)
+        except requests.RequestException as exc:
+            result.error = f"Request error: {exc}"
+            return None
+
+        result.http_status = resp.status_code
+        if resp.status_code != 429:
+            break
+
+        if attempt == RATE_LIMIT_RETRIES:
+            result.error = (f"HTTP 429 – rate limited after "
+                            f"{RATE_LIMIT_RETRIES} retries")
+            return None
+
+        # Honour Retry-After when present, else exponential backoff.
+        wait = RATE_LIMIT_BACKOFF * (2 ** attempt)
+        try:
+            wait = max(wait, float(resp.headers.get("Retry-After", 0)))
+        except ValueError:
+            pass                        # Retry-After may be an HTTP date
+        wait = min(wait, RATE_LIMIT_MAX_WAIT)
+        print(f"     · 429 from {urlparse(url).netloc} — "
+              f"waiting {wait:.0f}s (retry {attempt + 1}/{RATE_LIMIT_RETRIES})")
+        time.sleep(wait)
+
     if resp.status_code == 403:
         result.error = "HTTP 403 – blocked"
-        return None
-    if resp.status_code == 429:
-        result.error = "HTTP 429 – rate limited"
         return None
     if resp.status_code not in (200, 301, 302):
         result.error = f"HTTP {resp.status_code}"
